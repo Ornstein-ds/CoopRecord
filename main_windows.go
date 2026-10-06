@@ -76,6 +76,9 @@ type uiResult struct {
 	downloadPath string
 }
 type windowUI struct {
+	padFiles               [padCount]string
+	padLabels              [padCount]string
+	lastPadStatus          string
 	hwnd, font, titleFont  uintptr
 	controls               map[int]uintptr
 	devices                []inputDevice
@@ -218,6 +221,9 @@ func saveSettings(c settings) error {
 func (u *windowUI) settings() (settings, error) {
 	c := settings{Name: strings.TrimSpace(getText(u.controls[idName])), Address: strings.TrimSpace(getText(u.controls[idAddress])), Key: strings.TrimSpace(getText(u.controls[idKey])), Folder: getText(u.controls[idFolder])}
 	c.Role = selected(u.controls[idRole])
+	c.PadFiles = u.padFiles
+	c.PadKeys = u.readPadKeys()
+	c.PadKeysSet = true
 	i := selected(u.controls[idMic])
 	if i >= 0 && i < len(u.devices) {
 		c.DeviceID = u.devices[i].ID
@@ -329,6 +335,9 @@ func (u *windowUI) command(id int, notification int) {
 		return
 	}
 	if notification != 0 || u.busy {
+		return
+	}
+	if u.soundpadCommand(id) {
 		return
 	}
 	switch id {
@@ -447,6 +456,7 @@ func (u *windowUI) update() {
 	}
 drained:
 	v := u.e.snapshot()
+	u.updateSoundpad(v)
 	idle := v.Mode == "" && !u.busy
 	host := selected(u.controls[idRole]) == 0
 	for _, id := range []int{idName, idMic, idRefresh, idTest, idCorrection, idRole, idAddress, idKey} {
@@ -491,6 +501,11 @@ drained:
 func windowProc(hwnd uintptr, msg uint32, w, l uintptr) uintptr {
 	u := appUI
 	switch msg {
+	case 0x312: // WM_HOTKEY
+		if u != nil && !u.busy {
+			u.soundpadCommand(int(w))
+		}
+		return 0
 	case 0x111:
 		if u != nil {
 			u.command(int(w&0xffff), int((w>>16)&0xffff))
@@ -516,6 +531,9 @@ func windowProc(hwnd uintptr, msg uint32, w, l uintptr) uintptr {
 		u.async(func() error { u.e.disconnect(); return nil }, true)
 		return 0
 	case 2:
+		for i := 0; i < padCount; i++ {
+			call("UnregisterHotKey", hwnd, uintptr(idPadFirst+i))
+		}
 		call("PostQuitMessage", 0)
 		return 0
 	}
@@ -542,6 +560,9 @@ func main() {
 	if dpi == 0 {
 		dpi = 96
 	}
+	// Fit the doubled-width window on smaller monitors while preserving its layout.
+	fit := min(float64(dpi)/96, min(float64(call("GetSystemMetrics", 0)-40)/1440, float64(call("GetSystemMetrics", 1)-80)/690))
+	dpi = uintptr(fit * 96)
 	u := &windowUI{controls: make(map[int]uintptr), e: newEngine(captureAudio), results: make(chan uiResult, 16), scale: float64(dpi) / 96}
 	appUI = u
 	fontHeight := int32(-13 * int(dpi) / 96)
@@ -559,7 +580,7 @@ func main() {
 		return
 	}
 	style := uint32(0x00c80000 | 0x00020000)
-	r := rect{Right: int32(u.px(720)), Bottom: int32(u.px(690))}
+	r := rect{Right: int32(u.px(1440)), Bottom: int32(u.px(690))}
 	call("AdjustWindowRectEx", uintptr(unsafe.Pointer(&r)), uintptr(style), 0, 0x10000)
 	u.hwnd = call("CreateWindowExW", 0x10000, uintptr(unsafe.Pointer(class)), uintptr(unsafe.Pointer(wide("CoopRecord v"+appVersion+" — запись подкаста"))), uintptr(style), 0x80000000, 0x80000000, uintptr(r.Right-r.Left), uintptr(r.Bottom-r.Top), 0, 0, instance, 0)
 	if u.hwnd == 0 {
@@ -574,6 +595,7 @@ func main() {
 	u.label("Совместная запись подкаста  ·  WAV 48 кГц / 16 бит  ·  Windows x64", 24, 47, 680)
 	u.control(0, "BUTTON", "1. Ваш звук", 7, 20, 78, 680, 143)
 	c := loadSettings()
+	u.createSoundpad(c)
 	u.role = c.Role
 	u.connections[0].address, u.connections[0].key = "0.0.0.0:"+defaultPort, sessionKey()
 	u.connections[1].address = "26.0.0.1:" + defaultPort
@@ -614,6 +636,9 @@ func main() {
 	u.button(idRecover, "Восстановить WAV…", 20, 656, 195)
 	u.label("Для разговора используйте отдельный звонок и наушники.", 230, 662, 476)
 	u.refreshDevices(c.DeviceID)
+	if err := u.applyPadKeys(); err != nil {
+		u.e.lastError = err.Error()
+	}
 	u.update()
 	call("SetTimer", u.hwnd, 1, 150, 0)
 	call("ShowWindow", u.hwnd, 1)

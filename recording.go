@@ -21,6 +21,7 @@ type trackInfo struct {
 	Remote       bool
 }
 type manifest struct {
+	Pads       []padInfo `json:",omitempty"`
 	Version    int
 	Created    string
 	Start, End int64
@@ -381,6 +382,19 @@ func renderTrack(dir string, t trackInfo, m manifest, total int64) (warnings []s
 }
 
 func renderMix(dir string, m manifest, total int64) error {
+	var pads *bufio.Reader
+	padBuffer := make([]byte, 8192)
+	if len(m.Pads) > 0 {
+		f, err := os.Open(filepath.Join(dir, "soundpad.wav"))
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		if _, err = f.Seek(44, 0); err != nil {
+			return err
+		}
+		pads = bufio.NewReader(f)
+	}
 	readers := make([]*bufio.Reader, 0, len(m.Tracks))
 	buffers := make([][]byte, 0, len(m.Tracks))
 	for _, t := range m.Tracks {
@@ -399,6 +413,11 @@ func renderMix(dir string, m manifest, total int64) error {
 		out := make([]byte, 8192)
 		for left := total; left > 0; {
 			n := int(min(left, 4096)) * 2
+			if pads != nil {
+				if _, err := io.ReadFull(pads, padBuffer[:n]); err != nil {
+					return err
+				}
+			}
 			for i, r := range readers {
 				if _, err := io.ReadFull(r, buffers[i][:n]); err != nil {
 					return err
@@ -409,7 +428,11 @@ func renderMix(dir string, m manifest, total int64) error {
 				for _, b := range buffers {
 					sum += int32(int16(binary.LittleEndian.Uint16(b[j:])))
 				}
-				binary.LittleEndian.PutUint16(out[j:], uint16(int16(sum/int32(len(readers)))))
+				mixed := sum / int32(len(readers))
+				if pads != nil {
+					mixed += int32(int16(binary.LittleEndian.Uint16(padBuffer[j:])))
+				}
+				binary.LittleEndian.PutUint16(out[j:], uint16(int16(max(-32768, min(32767, mixed)))))
 			}
 			if _, err := w.Write(out[:n]); err != nil {
 				return err
@@ -430,7 +453,7 @@ func exportSession(dir string) (manifest, error) {
 	if err = json.Unmarshal(b, &m); err != nil {
 		return m, err
 	}
-	if (m.Version != 1 && m.Version != 2) || m.Start <= 0 || len(m.Tracks) == 0 || len(m.Tracks) > maxPeers+1 {
+	if (m.Version < 1 || m.Version > 3) || m.Start <= 0 || len(m.Tracks) == 0 || len(m.Tracks) > maxPeers+1 {
 		return m, fmt.Errorf("неподдерживаемая сессия")
 	}
 	ids := map[string]bool{}
@@ -485,6 +508,9 @@ func exportSession(dir string) (manifest, error) {
 			return m, e
 		}
 		m.Warnings = append(m.Warnings, warnings...)
+	}
+	if err = renderSoundpad(dir, m, total); err != nil {
+		return m, err
 	}
 	if err = renderMix(dir, m, total); err != nil {
 		return m, err

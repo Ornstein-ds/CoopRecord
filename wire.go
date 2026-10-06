@@ -14,7 +14,7 @@ const sampleRate = 48000
 const maxDuration = 6 * time.Hour
 const maxPeers = 7
 const defaultPort = "47652"
-const protocolVersion = 2
+const protocolVersion = 3
 
 type packet struct {
 	Time          int64
@@ -22,19 +22,22 @@ type packet struct {
 	Discontinuity bool
 }
 type message struct {
-	Type          string `json:"type"`
-	Version       int    `json:"version,omitempty"`
-	Name          string `json:"name,omitempty"`
-	Key           string `json:"key,omitempty"`
-	Session       string `json:"session,omitempty"`
-	T0            int64  `json:"t0,omitempty"`
-	T1            int64  `json:"t1,omitempty"`
-	T2            int64  `json:"t2,omitempty"`
-	Time          int64  `json:"time,omitempty"`
-	PCM           []byte `json:"pcm,omitempty"`
-	Discontinuity bool   `json:"discontinuity,omitempty"`
-	Error         string `json:"error,omitempty"`
-	CorrectionMS  int    `json:"correction_ms,omitempty"`
+	Pads          []padInfo `json:"pads,omitempty"`
+	Pad           int       `json:"pad,omitempty"`
+	Offset        int64     `json:"offset,omitempty"`
+	Type          string    `json:"type"`
+	Version       int       `json:"version,omitempty"`
+	Name          string    `json:"name,omitempty"`
+	Key           string    `json:"key,omitempty"`
+	Session       string    `json:"session,omitempty"`
+	T0            int64     `json:"t0,omitempty"`
+	T1            int64     `json:"t1,omitempty"`
+	T2            int64     `json:"t2,omitempty"`
+	Time          int64     `json:"time,omitempty"`
+	PCM           []byte    `json:"pcm,omitempty"`
+	Discontinuity bool      `json:"discontinuity,omitempty"`
+	Error         string    `json:"error,omitempty"`
+	CorrectionMS  int       `json:"correction_ms,omitempty"`
 }
 
 type wire struct {

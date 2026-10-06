@@ -19,11 +19,16 @@ import (
 )
 
 type settings struct {
+	PadFiles                             [padCount]string
+	PadKeys                              [padCount]uint16
+	PadKeysSet                           bool
 	Name, DeviceID, Address, Folder, Key string
 	CorrectionMS                         int
 	Role                                 int
 }
 type peer struct {
+	padBytes   int64
+	padsReady  bool
 	w          *wire
 	name       string
 	correction int
@@ -33,13 +38,15 @@ type peer struct {
 	number     int
 }
 type recording struct {
-	dir, id  string
-	m        manifest
-	local    *trackWriter
-	tracks   map[*peer]*trackWriter
-	ended    map[*peer]chan struct{}
-	stopping bool
-	done     chan struct{}
+	padEvents     *os.File
+	padEventCount int
+	dir, id       string
+	m             manifest
+	local         *trackWriter
+	tracks        map[*peer]*trackWriter
+	ended         map[*peer]chan struct{}
+	stopping      bool
+	done          chan struct{}
 }
 type audioEvent struct {
 	packet  packet
@@ -48,7 +55,14 @@ type audioEvent struct {
 }
 type captureFunc func(context.Context, string, chan<- error, func(packet) error, *atomic.Int32) error
 type engine struct {
-	mu sync.Mutex
+	padTriggerMu            sync.Mutex
+	pads                    [padCount]padClip
+	padDir                  string
+	padBytes, padTotal      int64
+	padsReady, padReceiving bool
+	padVoices               int
+	playPad                 func(context.Context, []byte, int64) error
+	mu                      sync.Mutex
 	// Capture never takes mu: disk writes/flushes hold it and may stall for >100 ms.
 	inputMu                             sync.Mutex
 	audioID                             string
@@ -68,6 +82,10 @@ type engine struct {
 	nextPeer                            int
 }
 type viewState struct {
+	Pads                                [padCount]padInfo
+	PadProgress                         int
+	PadStatus                           string
+	PadsReady                           bool
 	Mode, Status, Error, Folder, People string
 	Recording, CanRecord, Exporting     bool
 	Level                               int
@@ -75,18 +93,42 @@ type viewState struct {
 }
 
 func newEngine(capture captureFunc) *engine {
-	return &engine{capture: capture, status: "Выберите микрофон и роль сессии."}
+	return &engine{capture: capture, playPad: playPadPCM, status: "Выберите микрофон и роль сессии."}
 }
 func (e *engine) snapshot() viewState {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	v := viewState{Mode: e.mode, Status: e.status, Error: e.lastError, Folder: e.lastFolder, Level: int(e.level.Load()), Exporting: e.exporting}
+	for i, p := range e.pads {
+		v.Pads[i] = p.Info
+	}
+	v.PadsReady = e.padsReadyLocked()
+	if e.mode == "guest" {
+		v.PadsReady = e.padsReady
+	}
+	percent := func(n int64, ready bool) int {
+		if ready {
+			return 100
+		}
+		if e.padTotal == 0 {
+			return 0
+		}
+		return min(99, int(n*100/e.padTotal))
+	}
+	v.PadProgress = percent(e.padBytes, e.padsReady)
+	v.PadStatus = fmt.Sprintf("Ваш ПК: %d%%", v.PadProgress)
 	if e.mode != "" {
 		v.People = e.cfg.Name + " — вы\r\n"
 	}
-	v.CanRecord = e.mode == "host" && e.inputReady && !e.exporting
+	v.CanRecord = e.mode == "host" && e.inputReady && !e.exporting && e.padsReadyLocked() && e.padVoices == 0
+	if e.padVoices > 0 {
+		v.PadStatus += "\r\nПеред началом записи дождитесь окончания звуков."
+	}
 	peers := e.sortedPeers()
 	for _, p := range peers {
+		progress := percent(p.padBytes, p.padsReady)
+		v.PadProgress = min(v.PadProgress, progress)
+		v.PadStatus += fmt.Sprintf("\r\n%s: %d%%", p.name, progress)
 		state := "проверка микрофона и часов"
 		if p.ready && len(p.samples) >= 8 {
 			best := p.samples[max(0, len(p.samples)-8):]
@@ -151,6 +193,16 @@ func (e *engine) begin(c settings, mode string) error {
 	if e.mode != "" || e.exporting {
 		return fmt.Errorf("сначала завершите текущую сессию")
 	}
+	dir, err := os.MkdirTemp("", "CoopRecord-sounds-")
+	if err != nil {
+		return err
+	}
+	e.padDir = dir
+	e.pads = [padCount]padClip{}
+	e.padsReady = false
+	e.padReceiving = false
+	e.padBytes = 0
+	e.padTotal = 0
 	e.cfg = c
 	e.mode = mode
 	e.lastError = ""
@@ -260,6 +312,10 @@ func (e *engine) host(c settings) error {
 		return err
 	}
 	if err := e.begin(c, "host"); err != nil {
+		return err
+	}
+	if err := e.preparePads(c.PadFiles); err != nil {
+		e.disconnect()
 		return err
 	}
 	ln, err := net.Listen("tcp", c.Address)
@@ -388,15 +444,29 @@ func (e *engine) servePeer(ctx context.Context, w *wire) {
 	pingCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go e.pingPeer(pingCtx, p)
+	go e.sendPads(pingCtx, p)
 	for {
 		m, err = w.receive()
 		received := clockNow()
 		if err != nil {
 			return
 		}
+		if m.Type == "pad_request" {
+			if err = e.triggerPad(m.Pad); err != nil {
+				_ = w.send(message{Type: "pad_notice", Error: err.Error()})
+			}
+			continue
+		}
 		e.mu.Lock()
 		r := e.rec
 		switch m.Type {
+		case "pads_progress", "pads_ready":
+			if m.Offset < p.padBytes || m.Offset > e.padTotal || (m.Type == "pads_ready" && m.Offset != e.padTotal) {
+				err = fmt.Errorf("неверный прогресс саундпада")
+			} else {
+				p.padBytes = m.Offset
+				p.padsReady = m.Type == "pads_ready"
+			}
 		case "ready":
 			p.ready = true
 		case "pong":
@@ -503,6 +573,22 @@ func (e *engine) readHost(ctx context.Context, w *wire) {
 			return
 		}
 		switch m.Type {
+		case "pads_begin", "pad_chunk", "pads_end":
+			err = e.receivePads(ctx, w, m)
+		case "pad_notice":
+			e.mu.Lock()
+			e.lastError = m.Error
+			e.mu.Unlock()
+		case "pad_play":
+			e.mu.Lock()
+			if !e.padsReady || m.Pad < 0 || m.Pad >= padCount || len(e.pads[m.Pad].PCM) == 0 || abs64(m.Time-clockNow()) > int64(10*time.Second) {
+				err = fmt.Errorf("неверная команда воспроизведения")
+				e.mu.Unlock()
+			} else {
+				pcm := e.pads[m.Pad].PCM
+				e.mu.Unlock()
+				e.schedulePad(ctx, pcm, m.Time)
+			}
 		case "ping":
 			err = w.send(message{Type: "pong", T0: m.T0, T1: received, T2: clockNow()})
 		case "start":
@@ -552,7 +638,7 @@ func (e *engine) readHost(ctx context.Context, w *wire) {
 
 func (e *engine) startRecording() error {
 	e.mu.Lock()
-	if e.mode != "host" || !e.inputReady || e.rec != nil || e.exporting {
+	if e.mode != "host" || !e.inputReady || e.rec != nil || e.exporting || !e.padsReadyLocked() || e.padVoices > 0 {
 		e.mu.Unlock()
 		return fmt.Errorf("хост не готов к записи")
 	}
@@ -569,7 +655,7 @@ func (e *engine) startRecording() error {
 		return err
 	}
 	r := &recording{dir: dir, id: filepath.Base(dir), tracks: make(map[*peer]*trackWriter), ended: make(map[*peer]chan struct{}), done: make(chan struct{})}
-	r.m = manifest{Version: 2, Created: time.Now().Format(time.RFC3339), Start: clockNow() + int64(time.Second)}
+	r.m = manifest{Version: 3, Created: time.Now().Format(time.RFC3339), Start: clockNow() + int64(time.Second)}
 	r.m.Tracks = append(r.m.Tracks, trackInfo{ID: "track-00", Name: e.cfg.Name, CorrectionMS: e.cfg.CorrectionMS})
 	r.local, err = newTrack(dir, "track-00")
 	if err == nil {
@@ -594,9 +680,17 @@ func (e *engine) startRecording() error {
 		}
 	}
 	if err == nil {
+		err = e.preparePadRecording(r)
+	}
+	if err == nil {
+		// Copying the sound bank can take longer than the one-second start lead.
+		r.m.Start = clockNow() + int64(time.Second)
 		err = saveManifest(dir, r.m)
 	}
 	if err != nil {
+		if r.padEvents != nil {
+			r.padEvents.Close()
+		}
 		if r.local != nil {
 			r.local.close()
 		}
@@ -707,6 +801,9 @@ func (e *engine) stopRecording() error {
 		}
 	}
 	err := r.local.close()
+	if r.padEvents != nil {
+		err = errors.Join(err, r.padEvents.Sync(), r.padEvents.Close())
+	}
 	for _, w := range r.tracks {
 		err = errors.Join(err, w.close())
 	}
@@ -758,6 +855,15 @@ func (e *engine) disconnect() {
 	e.mode = ""
 	e.liveID = ""
 	e.inputReady = false
+	if e.padDir != "" {
+		_ = os.RemoveAll(e.padDir)
+		e.padDir = ""
+	}
+	e.padsReady = false
+	e.padReceiving = false
+	e.pads = [padCount]padClip{}
+	e.padBytes = 0
+	e.padTotal = 0
 	e.status = "Отключено. Можно создать новую сессию."
 	e.level.Store(0)
 }

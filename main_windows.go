@@ -47,6 +47,7 @@ const (
 	idOpen
 	idStatus
 	idRecover
+	idUpdate
 )
 
 type winClass struct {
@@ -67,10 +68,12 @@ type winMessage struct {
 }
 type rect struct{ Left, Top, Right, Bottom int32 }
 type uiResult struct {
-	err      error
-	closing  bool
-	tested   bool
-	testDone chan struct{}
+	err          error
+	closing      bool
+	tested       bool
+	testDone     chan struct{}
+	notice       string
+	downloadPath string
 }
 type windowUI struct {
 	hwnd, font, titleFont  uintptr
@@ -329,6 +332,22 @@ func (u *windowUI) command(id int, notification int) {
 		return
 	}
 	switch id {
+	case idUpdate:
+		if u.e.snapshot().Mode != "" {
+			return
+		}
+		u.stopTest()
+		u.busy = true
+		setText(u.controls[idUpdate], "Скачивание / проверка…")
+		u.update()
+		go func() {
+			path, tag, err := checkAppUpdate()
+			notice := "Установлена версия v" + appVersion + ".\r\nПоследний релиз на GitHub: " + tag + ".\r\nОбновление не требуется."
+			if path != "" {
+				notice = "Скачана версия " + tag + ". Контрольная сумма проверена.\r\n\r\nЗакройте CoopRecord, распакуйте ZIP и замените файлы приложения. Записи и настройки сохранятся.\r\n\r\n" + path
+			}
+			u.results <- uiResult{err: err, notice: notice, downloadPath: path}
+		}()
 	case idRefresh:
 		u.stopTest()
 		u.refreshDevices("")
@@ -398,6 +417,16 @@ func (u *windowUI) update() {
 	for {
 		select {
 		case result := <-u.results:
+			if result.notice != "" {
+				setText(u.controls[idUpdate], "Обновить приложение")
+				if result.err == nil {
+					messageBox(u.hwnd, result.notice, 0x40)
+					if result.downloadPath != "" {
+						dir := filepath.Dir(result.downloadPath)
+						shell32.NewProc("ShellExecuteW").Call(u.hwnd, uintptr(unsafe.Pointer(wide("open"))), uintptr(unsafe.Pointer(wide(dir))), 0, 0, 1)
+					}
+				}
+			}
 			if result.tested {
 				if u.testCancel != nil && result.testDone == u.testDone {
 					u.stopTest()
@@ -430,6 +459,7 @@ drained:
 	enable(u.controls[idRecord], !u.busy && v.CanRecord)
 	enable(u.controls[idStop], !u.busy && v.Recording && v.Mode == "host")
 	enable(u.controls[idRecover], idle)
+	enable(u.controls[idUpdate], idle)
 	connect := "Создать сессию"
 	if !host {
 		connect = "Подключиться"
@@ -531,7 +561,7 @@ func main() {
 	style := uint32(0x00c80000 | 0x00020000)
 	r := rect{Right: int32(u.px(720)), Bottom: int32(u.px(690))}
 	call("AdjustWindowRectEx", uintptr(unsafe.Pointer(&r)), uintptr(style), 0, 0x10000)
-	u.hwnd = call("CreateWindowExW", 0x10000, uintptr(unsafe.Pointer(class)), uintptr(unsafe.Pointer(wide("CoopRecord — запись подкаста"))), uintptr(style), 0x80000000, 0x80000000, uintptr(r.Right-r.Left), uintptr(r.Bottom-r.Top), 0, 0, instance, 0)
+	u.hwnd = call("CreateWindowExW", 0x10000, uintptr(unsafe.Pointer(class)), uintptr(unsafe.Pointer(wide("CoopRecord v"+appVersion+" — запись подкаста"))), uintptr(style), 0x80000000, 0x80000000, uintptr(r.Right-r.Left), uintptr(r.Bottom-r.Top), 0, 0, instance, 0)
 	if u.hwnd == 0 {
 		messageBox(0, "Не удалось создать окно.", 0x10)
 		return
@@ -539,6 +569,8 @@ func main() {
 	syscall.NewLazyDLL("comctl32.dll").NewProc("InitCommonControls").Call()
 	title := u.control(0, "STATIC", "CoopRecord", 0, 22, 12, 350, 34)
 	sendMessage.Call(title, 0x30, u.titleFont, 1)
+	u.label("v"+appVersion, 403, 23, 80)
+	u.button(idUpdate, "Обновить приложение", 505, 15, 195)
 	u.label("Совместная запись подкаста  ·  WAV 48 кГц / 16 бит  ·  Windows x64", 24, 47, 680)
 	u.control(0, "BUTTON", "1. Ваш звук", 7, 20, 78, 680, 143)
 	c := loadSettings()

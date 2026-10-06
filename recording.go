@@ -453,7 +453,7 @@ func exportSession(dir string) (manifest, error) {
 	if err = json.Unmarshal(b, &m); err != nil {
 		return m, err
 	}
-	if (m.Version < 1 || m.Version > 3) || m.Start <= 0 || len(m.Tracks) == 0 || len(m.Tracks) > maxPeers+1 {
+	if (m.Version < 1 || m.Version > 4) || m.Start <= 0 || len(m.Tracks) == 0 || len(m.Tracks) > maxPeers+1 {
 		return m, fmt.Errorf("неподдерживаемая сессия")
 	}
 	ids := map[string]bool{}

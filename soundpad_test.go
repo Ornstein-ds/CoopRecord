@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -247,6 +248,196 @@ func TestSoundpadValidation(t *testing.T) {
 	}
 }
 
+func TestSoundpadToggleSwitchAndRecording(t *testing.T) {
+	dir := t.TempDir()
+	host, guest := newEngine(syntheticCapture), newEngine(syntheticCapture)
+	defer host.disconnect()
+	defer guest.disconnect()
+	var active [2]atomic.Int32
+	var starts [2]atomic.Int32
+	for i, e := range []*engine{host, guest} {
+		e.playPad = func(ctx context.Context, pcm []byte, start int64) error {
+			if active[i].Add(1) != 1 {
+				t.Error("overlapping soundpad playback")
+			}
+			starts[i].Add(1)
+			defer active[i].Add(-1)
+			timer := time.NewTimer(time.Duration(max(0, start+int64(len(pcm)/2)*1e9/sampleRate-clockNow())))
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+			case <-timer.C:
+			}
+			return nil
+		}
+	}
+	c := settings{Name: "Host", DeviceID: "test", Key: "toggle-test", Address: "127.0.0.1:0", Folder: dir}
+	for i := 0; i < 2; i++ {
+		path := filepath.Join(dir, string(rune('a'+i))+".wav")
+		if err := writeWAV(path, sampleRate*3, func(w io.Writer) error {
+			pcm := make([]byte, sampleRate*6)
+			for pos := 0; pos < len(pcm); pos += 2 {
+				binary.LittleEndian.PutUint16(pcm[pos:], uint16(2000*(i+1)))
+			}
+			_, err := w.Write(pcm)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		c.PadFiles[i] = path
+	}
+	if err := host.host(c); err != nil {
+		t.Fatal(err)
+	}
+	host.mu.Lock()
+	c.Address = host.listener.Addr().String()
+	host.mu.Unlock()
+	c.Name = "Guest"
+	if err := guest.join(c); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return host.snapshot().CanRecord })
+	if err := host.startRecording(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(1100 * time.Millisecond)
+	if err := guest.triggerPad(0); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return starts[0].Load() == 1 && starts[1].Load() == 1 })
+	if err := host.triggerPad(1); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return starts[0].Load() == 2 && starts[1].Load() == 2 })
+	if err := guest.triggerPad(1); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return active[0].Load() == 0 && active[1].Load() == 0 })
+	// Toggle an already queued pad, then restart: all clients must preserve order.
+	for _, index := range []int{0, 0, 1, 1} {
+		if err := host.triggerPad(index); err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitFor(t, func() bool {
+		host.mu.Lock()
+		h := host.padVoices
+		host.mu.Unlock()
+		guest.mu.Lock()
+		g := guest.padVoices
+		guest.mu.Unlock()
+		return h == 0 && g == 0 && starts[0].Load() == 4 && starts[1].Load() == 4
+	})
+	// Leave a complete microphone block after the last pad event before export.
+	time.Sleep(150 * time.Millisecond)
+	if err := host.stopRecording(); err != nil {
+		t.Fatal(err)
+	}
+	folder := host.snapshot().Folder
+	b, err := os.ReadFile(filepath.Join(folder, "session.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m manifest
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(filepath.Join(folder, "soundpad.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	decoder := json.NewDecoder(f)
+	var events []padEvent
+	for {
+		var event padEvent
+		err := decoder.Decode(&event)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		events = append(events, event)
+	}
+	wantPads := []int{0, 1, -1, 0, -1, 1, -1}
+	if len(events) != len(wantPads) {
+		t.Fatalf("events: %+v", events)
+	}
+	for i, event := range events {
+		if event.Pad != wantPads[i] {
+			t.Fatalf("events: %+v", events)
+		}
+	}
+	sound, err := os.ReadFile(filepath.Join(folder, "soundpad.wav"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mix, err := os.ReadFile(filepath.Join(folder, "mix.wav"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for pos := int64(0); pos < int64((len(sound)-44)/2); pos++ {
+		want := uint16(0)
+		for _, event := range events {
+			if (event.Time-m.Start)*sampleRate/1e9 > pos {
+				break
+			}
+			want = 0
+			if event.Pad >= 0 && pos < (event.Time-m.Start)*sampleRate/1e9+sampleRate*3 {
+				want = uint16(2000 * (event.Pad + 1))
+			}
+		}
+		if binary.LittleEndian.Uint16(sound[44+pos*2:]) != want {
+			t.Fatalf("soundpad sample %d, want %d", pos, want)
+		}
+		if want > 0 && binary.LittleEndian.Uint16(mix[44+pos*2:]) != want+1000 {
+			t.Fatalf("mix sample %d", pos)
+		}
+	}
+	if _, err := exportSession(folder); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := os.ReadFile(filepath.Join(folder, "soundpad.wav"))
+	if err != nil || !bytes.Equal(recovered, sound) {
+		t.Fatal("recovery changed stopped sounds", err)
+	}
+}
+
+func TestSoundpadLegacyOverlap(t *testing.T) {
+	dir := t.TempDir()
+	pcm := make([]byte, 400)
+	for i := 0; i < len(pcm); i += 2 {
+		binary.LittleEndian.PutUint16(pcm[i:], 2000)
+	}
+	if err := os.WriteFile(padPath(dir, 0), pcm, 0600); err != nil {
+		t.Fatal(err)
+	}
+	m := manifest{Version: 3, Start: 1e9, End: 2e9, Pads: make([]padInfo, padCount)}
+	m.Pads[0] = padInfo{"tone", len(pcm), padHash(pcm)}
+	event, _ := json.Marshal(padEvent{0, m.Start})
+	if err := os.WriteFile(filepath.Join(dir, "soundpad.jsonl"), append(append(event, '\n'), event...), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, version := range []int{3, 4} {
+		m.Version = version
+		if err := renderSoundpad(dir, m, 200); err != nil {
+			t.Fatal(err)
+		}
+		b, err := os.ReadFile(filepath.Join(dir, "soundpad.wav"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := uint16(4000)
+		if version == 4 {
+			want = 2000
+		}
+		if binary.LittleEndian.Uint16(b[44:]) != want {
+			t.Fatal("incorrect legacy overlap")
+		}
+	}
+}
+
 func TestSoundpadPlaybackSmoke(t *testing.T) {
 	if os.Getenv("COOPRECORD_PLAYBACK_SMOKE") != "1" {
 		t.Skip("opt-in native output test with silence")
@@ -255,6 +446,16 @@ func TestSoundpadPlaybackSmoke(t *testing.T) {
 	defer cancel()
 	if err := playPadPCM(ctx, make([]byte, sampleRate/5), clockNow()+300e6); err != nil {
 		t.Fatal(err)
+	}
+	// Cancel an output buffer that is already playing, not only a queued start.
+	playing, stop := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer stop()
+	started := time.Now()
+	if err := playPadPCM(playing, make([]byte, sampleRate*2), clockNow()); err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(started) > 600*time.Millisecond {
+		t.Fatal("native playback did not stop promptly")
 	}
 	ctx, cancel = context.WithCancel(context.Background())
 	cancel()

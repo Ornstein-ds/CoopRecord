@@ -340,9 +340,9 @@ func (e *engine) triggerPad(index int) error {
 		e.mu.Unlock()
 		return fmt.Errorf("дождитесь готовности саундпада у всех участников")
 	}
-	if e.padVoices >= 32 {
+	if len(e.padCommands) == cap(e.padCommands) {
 		e.mu.Unlock()
-		return fmt.Errorf("уже звучат 32 пада; дождитесь их завершения")
+		return fmt.Errorf("слишком много команд саундпада; попробуйте через секунду")
 	}
 	now := clockNow()
 	lead := int64(500 * time.Millisecond)
@@ -350,7 +350,10 @@ func (e *engine) triggerPad(index int) error {
 	for _, p := range peers {
 		lead = max(lead, 2*p.samples[len(p.samples)-1].RTT+200e6)
 	}
-	start := now + lead
+	start := max(now+lead, e.padCommandTime+1e6)
+	if e.padIndex == index && e.padUntil > now {
+		index = -1 // Toggle the currently playing or scheduled pad off.
+	}
 	if err := e.logPadLocked(index, start); err != nil {
 		e.mu.Unlock()
 		return err
@@ -361,37 +364,87 @@ func (e *engine) triggerPad(index int) error {
 		s := anchors[len(anchors)-1]
 		starts[i] = start + s.Remote - s.Host
 	}
-	ctx, pcm := e.ctx, e.pads[index].PCM
+	err := e.schedulePadLocked(e.ctx, index, start)
 	e.mu.Unlock()
+	if err != nil {
+		return err
+	}
 	for i, p := range peers {
 		if err := p.w.send(message{Type: "pad_play", Pad: index, Time: starts[i]}); err != nil {
 			p.w.Close()
 			return err
 		}
 	}
-	e.schedulePad(ctx, pcm, start)
 	return nil
 }
 
-func (e *engine) schedulePad(ctx context.Context, pcm []byte, start int64) {
-	e.mu.Lock()
-	if e.padVoices >= 32 {
-		e.lastError = "Слишком много одновременно звучащих падов"
-		e.mu.Unlock()
-		return
+type padPlayback struct {
+	pcm   []byte
+	start int64
+}
+
+// Called with mu held; host and guests apply the same ordered playback commands.
+func (e *engine) schedulePadLocked(ctx context.Context, index int, start int64) error {
+	if ctx.Err() != nil || ctx != e.ctx || len(e.padCommands) == cap(e.padCommands) {
+		return fmt.Errorf("очередь саундпада недоступна")
 	}
+	var pcm []byte
+	if index >= 0 {
+		pcm = e.pads[index].PCM
+	}
+	e.padIndex, e.padCommandTime = index, start
+	e.padUntil = start + int64(len(pcm)/2)*1e9/sampleRate
 	e.padVoices++
-	play := e.playPad
-	e.mu.Unlock()
-	go func() {
-		err := play(ctx, pcm, start)
+	e.padCommands <- padPlayback{pcm, start}
+	return nil
+}
+
+func (e *engine) runPads(ctx context.Context, commands <-chan padPlayback) {
+	var cancel context.CancelFunc
+	var done chan struct{}
+	stop := func() {
+		if cancel != nil {
+			cancel()
+			<-done // waveOutReset/Close must finish before the next sound starts.
+			cancel = nil
+		}
+	}
+	defer stop()
+	finished := func(err error) {
 		e.mu.Lock()
 		defer e.mu.Unlock()
-		e.padVoices--
-		if err != nil && ctx.Err() == nil {
-			e.lastError = "Саундпад: " + err.Error()
+		if ctx == e.ctx {
+			e.padVoices--
+			if err != nil && ctx.Err() == nil {
+				e.lastError = "Саундпад: " + err.Error()
+			}
 		}
-	}()
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case command := <-commands:
+			timer := time.NewTimer(time.Duration(max(0, command.start-clockNow())))
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			stop()
+			if len(command.pcm) == 0 {
+				finished(nil)
+				continue
+			}
+			playCtx, playCancel := context.WithCancel(ctx)
+			cancel, done = playCancel, make(chan struct{})
+			go func(done chan struct{}) {
+				defer close(done)
+				finished(e.playPad(playCtx, command.pcm, command.start))
+			}(done)
+		}
+	}
 }
 
 // Used by export too; validates cached audio instead of trusting a mutable source path.

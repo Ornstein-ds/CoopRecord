@@ -39,7 +39,7 @@ func (e *engine) logPadLocked(index int, start int64) error {
 		return nil
 	}
 	if r.padEventCount >= 20000 {
-		return fmt.Errorf("достигнут лимит 20000 запусков саундпада в одной записи")
+		return fmt.Errorf("достигнут лимит 20000 команд саундпада в одной записи")
 	}
 	if err := json.NewEncoder(r.padEvents).Encode(padEvent{index, start}); err != nil {
 		return err
@@ -85,32 +85,39 @@ func renderSoundpad(dir string, m manifest, total int64) error {
 		if err != nil {
 			return err
 		}
-		if len(events) >= 20000 || event.Pad < 0 || event.Pad >= padCount || len(clips[event.Pad]) == 0 || event.Time <= 0 || event.Time < m.Start-120e9 || event.Time > m.End+10e9 {
+		stop := m.Version >= 4 && event.Pad == -1
+		if len(events) >= 20000 || (!stop && (event.Pad < 0 || event.Pad >= padCount || len(clips[event.Pad]) == 0)) || event.Time <= 0 || event.Time < m.Start-120e9 || event.Time > m.End+10e9 {
 			return fmt.Errorf("повреждён журнал саундпада")
 		}
 		events = append(events, event)
 	}
-	sort.Slice(events, func(i, j int) bool { return events[i].Time < events[j].Time })
+	sort.SliceStable(events, func(i, j int) bool { return events[i].Time < events[j].Time })
 	return writeWAV(filepath.Join(dir, "soundpad.wav"), total, func(w io.Writer) error {
 		next := 0
-		var active []padEvent
+		var active []int
 		for cursor := int64(0); cursor < total; {
 			count := min(int64(4096), total-cursor)
 			for next < len(events) && (events[next].Time-m.Start)*sampleRate/1e9 < cursor+count {
-				active = append(active, events[next])
+				if events[next].Pad >= 0 {
+					active = append(active, next)
+				}
 				next++
 			}
 			sums := make([]int64, count)
 			keep := active[:0]
-			for _, event := range active {
+			for _, index := range active {
+				event := events[index]
 				start := (event.Time - m.Start) * sampleRate / 1e9
 				pcm := clips[event.Pad]
 				end := start + int64(len(pcm)/2)
+				if m.Version >= 4 && index+1 < len(events) {
+					end = min(end, (events[index+1].Time-m.Start)*sampleRate/1e9)
+				}
 				for pos := max(cursor, start); pos < min(cursor+count, end); pos++ {
 					sums[pos-cursor] += int64(int16(binary.LittleEndian.Uint16(pcm[(pos-start)*2:])))
 				}
 				if end > cursor+count {
-					keep = append(keep, event)
+					keep = append(keep, index)
 				}
 			}
 			active = keep

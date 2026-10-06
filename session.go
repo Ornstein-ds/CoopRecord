@@ -55,14 +55,17 @@ type audioEvent struct {
 }
 type captureFunc func(context.Context, string, chan<- error, func(packet) error, *atomic.Int32) error
 type engine struct {
-	padTriggerMu            sync.Mutex
-	pads                    [padCount]padClip
-	padDir                  string
-	padBytes, padTotal      int64
-	padsReady, padReceiving bool
-	padVoices               int
-	playPad                 func(context.Context, []byte, int64) error
-	mu                      sync.Mutex
+	padTriggerMu             sync.Mutex
+	pads                     [padCount]padClip
+	padDir                   string
+	padBytes, padTotal       int64
+	padsReady, padReceiving  bool
+	padVoices                int
+	padIndex                 int
+	padUntil, padCommandTime int64
+	padCommands              chan padPlayback
+	playPad                  func(context.Context, []byte, int64) error
+	mu                       sync.Mutex
 	// Capture never takes mu: disk writes/flushes hold it and may stall for >100 ms.
 	inputMu                             sync.Mutex
 	audioID                             string
@@ -209,6 +212,10 @@ func (e *engine) begin(c settings, mode string) error {
 	e.inputReady = false
 	e.peers = make(map[*peer]bool)
 	e.ctx, e.cancel = context.WithCancel(context.Background())
+	e.padVoices, e.padIndex = 0, -1
+	e.padUntil, e.padCommandTime = 0, 0
+	e.padCommands = make(chan padPlayback, 32)
+	go e.runPads(e.ctx, e.padCommands)
 	e.audio = make(chan audioEvent, 1024)
 	e.inputMu.Lock()
 	e.audioID = ""
@@ -581,14 +588,12 @@ func (e *engine) readHost(ctx context.Context, w *wire) {
 			e.mu.Unlock()
 		case "pad_play":
 			e.mu.Lock()
-			if !e.padsReady || m.Pad < 0 || m.Pad >= padCount || len(e.pads[m.Pad].PCM) == 0 || abs64(m.Time-clockNow()) > int64(10*time.Second) {
+			if !e.padsReady || m.Pad < -1 || m.Pad >= padCount || (m.Pad >= 0 && len(e.pads[m.Pad].PCM) == 0) || abs64(m.Time-clockNow()) > int64(10*time.Second) {
 				err = fmt.Errorf("неверная команда воспроизведения")
-				e.mu.Unlock()
 			} else {
-				pcm := e.pads[m.Pad].PCM
-				e.mu.Unlock()
-				e.schedulePad(ctx, pcm, m.Time)
+				err = e.schedulePadLocked(ctx, m.Pad, m.Time)
 			}
+			e.mu.Unlock()
 		case "ping":
 			err = w.send(message{Type: "pong", T0: m.T0, T1: received, T2: clockNow()})
 		case "start":
@@ -658,7 +663,7 @@ func (e *engine) startRecording() error {
 		return err
 	}
 	r := &recording{dir: dir, id: filepath.Base(dir), tracks: make(map[*peer]*trackWriter), ended: make(map[*peer]chan struct{}), done: make(chan struct{})}
-	r.m = manifest{Version: 3, Created: time.Now().Format(time.RFC3339), Start: clockNow() + int64(time.Second)}
+	r.m = manifest{Version: 4, Created: time.Now().Format(time.RFC3339), Start: clockNow() + int64(time.Second)}
 	r.m.Tracks = append(r.m.Tracks, trackInfo{ID: "track-00", Name: e.cfg.Name, CorrectionMS: e.cfg.CorrectionMS})
 	r.local, err = newTrack(dir, "track-00")
 	if err == nil {

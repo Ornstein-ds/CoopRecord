@@ -56,12 +56,12 @@ func (u *windowUI) createSoundpad(c settings) {
 	u.label("Саундпад · 9 звуков для всей сессии", 746, 22, 660)
 	u.label("Хост выбирает WAV/MP3 до создания сессии. Клавиши — на каждом ПК.", 746, 49, 675)
 	for i := 0; i < padCount; i++ {
-		x, y := 746+(i%3)*222, 82+(i/3)*177
-		u.control(idPadFirst+i, "BUTTON", fmt.Sprintf("%d\r\nПусто", i+1), 0x10000|0x2000, x, y, 148, 148)
-		u.button(idPadLoadFirst+i, "Файл…", x+153, y, 64)
-		u.button(idPadClearFirst+i, "Убрать", x+153, y+35, 64)
-		u.label("Клавиша:", x+153, y+76, 66)
-		u.control(idPadKeyFirst+i, "msctls_hotkey32", "", 0x10000, x, y+151, 217, 23)
+		x, y := 746+(i%3)*170, 82+(i/3)*125
+		u.control(idPadFirst+i, "BUTTON", fmt.Sprintf("%d\r\nПусто", i+1), 0x10000|0x2000, x, y, 96, 96)
+		u.button(idPadLoadFirst+i, "Файл…", x+101, y, 64)
+		u.button(idPadClearFirst+i, "Убрать", x+101, y+35, 64)
+		u.label("Клавиша:", x+101, y+76, 66)
+		u.control(idPadKeyFirst+i, "msctls_hotkey32", "", 0x10000, x, y+99, 165, 23)
 		key := c.PadKeys[i]
 		if !c.PadKeysSet {
 			key = uint16('1'+i) | 6<<8

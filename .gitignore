@@ -1,0 +1,11 @@
+.tools/
+dist/
+recordings/
+*.test.exe
+*.log
+*.wav
+*.capture
+*.clock
+session.json
+*.partial
+

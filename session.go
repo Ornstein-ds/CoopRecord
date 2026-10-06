@@ -48,7 +48,10 @@ type audioEvent struct {
 }
 type captureFunc func(context.Context, string, chan<- error, func(packet) error, *atomic.Int32) error
 type engine struct {
-	mu                                  sync.Mutex
+	mu sync.Mutex
+	// Capture never takes mu: disk writes/flushes hold it and may stall for >100 ms.
+	inputMu                             sync.Mutex
+	audioID                             string
 	mode, status, lastError, lastFolder string
 	cfg                                 settings
 	ctx                                 context.Context
@@ -155,6 +158,9 @@ func (e *engine) begin(c settings, mode string) error {
 	e.peers = make(map[*peer]bool)
 	e.ctx, e.cancel = context.WithCancel(context.Background())
 	e.audio = make(chan audioEvent, 1024)
+	e.inputMu.Lock()
+	e.audioID = ""
+	e.inputMu.Unlock()
 	e.status = "Подготовка микрофона…"
 	return nil
 }
@@ -167,15 +173,12 @@ func (e *engine) startInput() error {
 	go e.processAudio(ctx, audio)
 	go func() {
 		err := e.capture(ctx, device, ready, func(p packet) error {
-			e.mu.Lock()
-			defer e.mu.Unlock()
+			e.inputMu.Lock()
+			defer e.inputMu.Unlock()
 			if ctx.Err() != nil {
 				return nil
 			}
-			id := e.liveID
-			if e.rec != nil && !e.rec.stopping {
-				id = e.rec.id
-			}
+			id := e.audioID
 			if id == "" {
 				return nil
 			}
@@ -233,7 +236,7 @@ func (e *engine) processAudio(ctx context.Context, audio <-chan audioEvent) {
 			e.mu.Unlock()
 			if w != nil && item.session != "" {
 				if item.done == nil {
-					err = w.send(message{Type: "audio", Session: item.session, Time: item.packet.Time, PCM: item.packet.PCM})
+					err = w.send(message{Type: "audio", Session: item.session, Time: item.packet.Time, PCM: item.packet.PCM, Discontinuity: item.packet.Discontinuity})
 				} else {
 					err = w.send(message{Type: "end", Session: item.session})
 				}
@@ -308,11 +311,14 @@ func (e *engine) join(c settings) error {
 	e.client = w
 	ctx := e.ctx
 	e.mu.Unlock()
-	if err = w.send(message{Type: "hello", Version: 1, Name: c.Name, Key: c.Key, CorrectionMS: c.CorrectionMS}); err == nil {
+	if err = w.send(message{Type: "hello", Version: protocolVersion, Name: c.Name, Key: c.Key, CorrectionMS: c.CorrectionMS}); err == nil {
 		var reply message
 		reply, err = w.receive()
 		if err == nil && reply.Type != "welcome" {
 			err = fmt.Errorf("хост: %s", reply.Error)
+		}
+		if err == nil && reply.Version != protocolVersion {
+			err = fmt.Errorf("несовместимая версия хоста: обновите CoopRecord на обоих ПК")
 		}
 	}
 	if err != nil {
@@ -350,10 +356,10 @@ func (e *engine) servePeer(ctx context.Context, w *wire) {
 		return
 	}
 	e.mu.Lock()
-	valid := m.Type == "hello" && m.Version == 1 && len(m.Name) > 0 && utf8.RuneCountInString(m.Name) <= 40 && !strings.ContainsAny(m.Name, "\x00\r\n") && m.CorrectionMS >= -2000 && m.CorrectionMS <= 2000 && subtle.ConstantTimeCompare([]byte(m.Key), []byte(e.cfg.Key)) == 1
+	valid := m.Type == "hello" && m.Version == protocolVersion && len(m.Name) > 0 && utf8.RuneCountInString(m.Name) <= 40 && !strings.ContainsAny(m.Name, "\x00\r\n") && m.CorrectionMS >= -2000 && m.CorrectionMS <= 2000 && subtle.ConstantTimeCompare([]byte(m.Key), []byte(e.cfg.Key)) == 1
 	if !valid || ctx.Err() != nil || e.rec != nil || e.exporting || len(e.peers) >= maxPeers {
 		e.mu.Unlock()
-		_ = w.send(message{Type: "error", Error: "Неверный ключ/версия, сессия уже записывается или заполнена."})
+		_ = w.send(message{Type: "error", Error: "Неверный ключ/версия, сессия уже записывается или заполнена. При несовпадении версий обновите CoopRecord на обоих ПК."})
 		return
 	}
 	e.nextPeer++
@@ -376,7 +382,7 @@ func (e *engine) servePeer(ctx context.Context, w *wire) {
 			e.fail(fmt.Errorf("%s отключился; полученный звук сохранён", p.name))
 		}
 	}()
-	if w.send(message{Type: "welcome", Version: 1}) != nil {
+	if w.send(message{Type: "welcome", Version: protocolVersion}) != nil {
 		return
 	}
 	pingCtx, cancel := context.WithCancel(ctx)
@@ -423,7 +429,7 @@ func (e *engine) servePeer(ctx context.Context, w *wire) {
 					err = fmt.Errorf("аудиометка за пределами допустимого времени")
 				}
 				if err == nil {
-					err = r.tracks[p].append(packet{Time: m.Time, PCM: m.PCM})
+					err = r.tracks[p].append(packet{Time: m.Time, PCM: m.PCM, Discontinuity: m.Discontinuity})
 				}
 			}
 		case "end":
@@ -505,6 +511,9 @@ func (e *engine) readHost(ctx context.Context, w *wire) {
 				err = fmt.Errorf("неверная команда начала записи")
 			} else {
 				e.liveID = m.Session
+				e.inputMu.Lock()
+				e.audioID = m.Session
+				e.inputMu.Unlock()
 				e.status = "Идёт запись. Звук сохраняется на компьютере хоста."
 			}
 			e.mu.Unlock()
@@ -512,6 +521,8 @@ func (e *engine) readHost(ctx context.Context, w *wire) {
 			e.mu.Lock()
 			if e.liveID == m.Session && m.Session != "" {
 				e.liveID = ""
+				e.inputMu.Lock()
+				e.audioID = ""
 				done := make(chan struct{})
 				select {
 				case e.audio <- audioEvent{session: m.Session, done: done}:
@@ -519,6 +530,7 @@ func (e *engine) readHost(ctx context.Context, w *wire) {
 				default:
 					err = fmt.Errorf("переполнена очередь аудио")
 				}
+				e.inputMu.Unlock()
 			}
 			e.mu.Unlock()
 		case "error":
@@ -557,7 +569,7 @@ func (e *engine) startRecording() error {
 		return err
 	}
 	r := &recording{dir: dir, id: filepath.Base(dir), tracks: make(map[*peer]*trackWriter), ended: make(map[*peer]chan struct{}), done: make(chan struct{})}
-	r.m = manifest{Version: 1, Created: time.Now().Format(time.RFC3339), Start: clockNow() + int64(time.Second)}
+	r.m = manifest{Version: 2, Created: time.Now().Format(time.RFC3339), Start: clockNow() + int64(time.Second)}
 	r.m.Tracks = append(r.m.Tracks, trackInfo{ID: "track-00", Name: e.cfg.Name, CorrectionMS: e.cfg.CorrectionMS})
 	r.local, err = newTrack(dir, "track-00")
 	if err == nil {
@@ -595,6 +607,9 @@ func (e *engine) startRecording() error {
 		return err
 	}
 	e.rec = r
+	e.inputMu.Lock()
+	e.audioID = r.id
+	e.inputMu.Unlock()
 	e.lastError = ""
 	e.lastFolder = dir
 	e.status = "Запись начнётся через 1 секунду…"
@@ -652,12 +667,15 @@ func (e *engine) stopRecording() error {
 	r.m.End = max(clockNow(), r.m.Start+int64(time.Millisecond))
 	e.status = "Получение последних аудиоблоков…"
 	localDone := make(chan struct{})
+	e.inputMu.Lock()
+	e.audioID = ""
 	select {
 	case e.audio <- audioEvent{session: r.id, done: localDone}:
 	default:
 		close(localDone)
 		r.m.Warnings = append(r.m.Warnings, "Переполнена локальная очередь аудио.")
 	}
+	e.inputMu.Unlock()
 	e.mu.Unlock()
 	for p := range r.tracks {
 		if err := p.w.send(message{Type: "stop", Session: r.id}); err != nil {

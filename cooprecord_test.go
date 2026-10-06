@@ -459,3 +459,164 @@ func TestMicrophoneSmoke(t *testing.T) {
 		})
 	}
 }
+
+func TestCaptureDoesNotWaitForDiskLock(t *testing.T) {
+	trigger := make(chan struct{})
+	emitted := make(chan error, 1)
+	source := func(ctx context.Context, _ string, ready chan<- error, emit func(packet) error, _ *atomic.Int32) error {
+		ready <- nil
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-trigger:
+		}
+		err := emit(packet{Time: clockNow(), PCM: []byte{0, 0}})
+		emitted <- err
+		return err
+	}
+	e := newEngine(source)
+	if err := e.begin(settings{Name: "test", DeviceID: "test", Key: "test-key"}, "host"); err != nil {
+		t.Fatal(err)
+	}
+	defer e.disconnect()
+	if err := e.startInput(); err != nil {
+		t.Fatal(err)
+	}
+	e.mu.Lock() // A slow Write/Sync holds this lock in processAudio/servePeer.
+	e.inputMu.Lock()
+	e.audioID = "test-session"
+	e.inputMu.Unlock()
+	close(trigger)
+	var err error
+	select {
+	case err = <-emitted:
+	case <-time.After(time.Second):
+		err = fmt.Errorf("microphone callback blocked on disk mutex")
+	}
+	e.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Opt-in: force a WASAPI overrun without saving or transmitting any audio.
+func TestMicrophoneRecoversAfterReaderDelay(t *testing.T) {
+	if os.Getenv("COOPRECORD_AUDIO_GLITCH_SMOKE") != "1" {
+		t.Skip("opt-in real microphone gap test")
+	}
+	devices, err := inputDevices()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(devices) == 0 {
+		t.Skip("no input devices")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	ready := make(chan error, 1)
+	var level atomic.Int32
+	packets, gaps, after := 0, 0, 0
+	err = captureAudio(ctx, devices[0].ID, ready, func(p packet) error {
+		packets++
+		if p.Discontinuity {
+			gaps++
+		}
+		if gaps > 0 {
+			after++
+		}
+		if packets == 5 {
+			time.Sleep(350 * time.Millisecond)
+		}
+		return nil
+	}, &level)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gaps == 0 || after < 10 {
+		t.Fatalf("gap not exercised/recovered: packets=%d gaps=%d after=%d", packets, gaps, after)
+	}
+	t.Logf("%s: %d gap(s), %d packets after gap; capture continued", devices[0].Name, gaps, after)
+}
+
+func TestShortDriverGapSurvivesNetworkAndExport(t *testing.T) {
+	dir := t.TempDir()
+	const start = int64(100 * time.Second)
+	const offset = int64(13 * time.Hour)
+	m := manifest{Version: 2, Start: start, End: start + 600e6, Tracks: []trackInfo{{ID: "track-00", Name: "Host"}, {ID: "track-01", Name: "Guest", Remote: true}}}
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	for trackIndex, track := range m.Tracks {
+		w, err := newTrack(dir, track.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		origin := start
+		if track.Remote {
+			origin += offset
+			if err := w.clock(clockSample{Remote: origin, Host: start, RTT: 1}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for i := 0; i < 60; i++ {
+			if track.Remote && (i == 20 || i == 21) {
+				continue
+			}
+			pcm := make([]byte, 960)
+			for j := 0; j < len(pcm); j += 2 {
+				binary.LittleEndian.PutUint16(pcm[j:], 1000)
+			}
+			p := packet{Time: origin + int64(i)*1e7, PCM: pcm, Discontinuity: trackIndex == 1 && (i == 0 || i == 22)}
+			if track.Remote {
+				sent := make(chan error, 1)
+				go func() {
+					sent <- (&wire{Conn: a}).send(message{Type: "audio", Time: p.Time, PCM: p.PCM, Discontinuity: p.Discontinuity})
+				}()
+				msg, err := (&wire{Conn: b}).receive()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = <-sent; err != nil {
+					t.Fatal(err)
+				}
+				p = packet{Time: msg.Time, PCM: msg.PCM, Discontinuity: msg.Discontinuity}
+			}
+			if err = w.append(p); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err = w.close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := saveManifest(dir, m); err != nil {
+		t.Fatal(err)
+	}
+	result, err := exportSession(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Warnings) != 1 || result.Warnings[0] != "Guest: разрывы временных меток: 1" {
+		t.Fatalf("warnings: %v", result.Warnings)
+	}
+	for _, name := range []string{"track-00.wav", "track-01.wav", "mix.wav"} {
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < sampleRate*6/10; i++ {
+			want := uint16(1000)
+			if i >= sampleRate/5 && i < sampleRate*22/100 {
+				if name == "track-01.wav" {
+					want = 0
+				}
+				if name == "mix.wav" {
+					want = 500
+				}
+			}
+			if got := binary.LittleEndian.Uint16(data[44+i*2:]); got != want {
+				t.Fatalf("%s sample %d: got %d want %d", name, i, got, want)
+			}
+		}
+	}
+}

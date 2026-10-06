@@ -79,7 +79,7 @@ func TestUpdateDownload(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.current == "" {
-				tc.current = appVersion
+				tc.current = "1.0.1"
 			}
 			if tc.digest == "" {
 				tc.digest = digest

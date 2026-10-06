@@ -185,9 +185,7 @@ func captureAudio(ctx context.Context, deviceID string, ready chan<- error, emit
 			if status&4 != 0 {
 				return fmt.Errorf("микрофон вернул недостоверную временную метку; запись остановлена")
 			}
-			if seen && status&1 != 0 {
-				return fmt.Errorf("пропуск аудио в драйвере микрофона; запись остановлена, принятый звук сохранён")
-			}
+			discontinuity := seen && status&1 != 0
 			seen = true
 			lastData = time.Now()
 			peak := int32(0)
@@ -201,7 +199,7 @@ func captureAudio(ctx context.Context, deviceID string, ready chan<- error, emit
 				}
 			}
 			level.Store(peak * 100 / 32768)
-			if err = emit(packet{Time: int64(qpc) * 100, PCM: pcm}); err != nil {
+			if err = emit(packet{Time: int64(qpc) * 100, PCM: pcm, Discontinuity: discontinuity}); err != nil {
 				return err
 			}
 		}

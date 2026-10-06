@@ -51,7 +51,11 @@ func (w *trackWriter) append(p packet) error {
 	}
 	var h [12]byte
 	binary.LittleEndian.PutUint64(h[:8], uint64(p.Time))
-	binary.LittleEndian.PutUint32(h[8:], uint32(len(p.PCM)))
+	n := uint32(len(p.PCM))
+	if p.Discontinuity {
+		n |= 1 << 31 // v2: mark the first packet after a driver-reported gap.
+	}
+	binary.LittleEndian.PutUint32(h[8:], n)
 	if _, err := w.audio.Write(h[:]); err != nil {
 		return err
 	}
@@ -92,6 +96,8 @@ func readPacket(r io.Reader) (packet, error) {
 	}
 	p.Time = int64(binary.LittleEndian.Uint64(h[:8]))
 	n := binary.LittleEndian.Uint32(h[8:])
+	p.Discontinuity = n&(1<<31) != 0
+	n &^= 1 << 31
 	if p.Time <= 0 || n == 0 || n%2 != 0 || n > sampleRate*2 {
 		return p, fmt.Errorf("повреждён исходный аудиоблок")
 	}
@@ -233,8 +239,8 @@ func captureTimeline(r io.Reader) ([]captureSpan, error) {
 			return nil, fmt.Errorf("неупорядоченные аудиоблоки")
 		}
 		// Preserve large discontinuities instead of stretching audio across missing time.
-		// Capture normally stops on a WASAPI discontinuity; sub-ms QPC noise is not one.
-		if count > 0 && abs64(p.Time-lastTime-lastFrames*1e9/sampleRate) > int64(50*time.Millisecond) {
+		// Explicit driver flags also preserve short gaps; ordinary QPC jitter does not.
+		if count > 0 && (p.Discontinuity || abs64(p.Time-lastTime-lastFrames*1e9/sampleRate) > int64(50*time.Millisecond)) {
 			if err = finish(); err != nil {
 				return nil, err
 			}
@@ -424,7 +430,7 @@ func exportSession(dir string) (manifest, error) {
 	if err = json.Unmarshal(b, &m); err != nil {
 		return m, err
 	}
-	if m.Version != 1 || m.Start <= 0 || len(m.Tracks) == 0 || len(m.Tracks) > maxPeers+1 {
+	if (m.Version != 1 && m.Version != 2) || m.Start <= 0 || len(m.Tracks) == 0 || len(m.Tracks) > maxPeers+1 {
 		return m, fmt.Errorf("неподдерживаемая сессия")
 	}
 	ids := map[string]bool{}

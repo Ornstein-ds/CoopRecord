@@ -55,6 +55,8 @@ type audioEvent struct {
 }
 type captureFunc func(context.Context, string, chan<- error, func(packet) error, *atomic.Int32) error
 type engine struct {
+	voice                    *voiceSession
+	voiceOutput              func(context.Context, chan<- error, func([]byte)) error
 	padTriggerMu             sync.Mutex
 	pads                     [padCount]padClip
 	padDir                   string
@@ -85,6 +87,7 @@ type engine struct {
 	nextPeer                            int
 }
 type viewState struct {
+	VoiceStatus                         string
 	Pads                                [padCount]padInfo
 	PadProgress                         int
 	PadStatus                           string
@@ -96,12 +99,13 @@ type viewState struct {
 }
 
 func newEngine(capture captureFunc) *engine {
-	return &engine{capture: capture, playPad: playPadPCM, status: "Выберите микрофон и роль сессии."}
+	return &engine{capture: capture, playPad: playPadPCM, voiceOutput: renderVoice, status: "Выберите микрофон и роль сессии."}
 }
 func (e *engine) snapshot() viewState {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	v := viewState{Mode: e.mode, Status: e.status, Error: e.lastError, Folder: e.lastFolder, Level: int(e.level.Load()), Exporting: e.exporting}
+	v.VoiceStatus = e.voice.status()
 	for i, p := range e.pads {
 		v.Pads[i] = p.Info
 	}
@@ -212,6 +216,7 @@ func (e *engine) begin(c settings, mode string) error {
 	e.inputReady = false
 	e.peers = make(map[*peer]bool)
 	e.ctx, e.cancel = context.WithCancel(context.Background())
+	e.voice = nil
 	e.padVoices, e.padIndex = 0, -1
 	e.padUntil, e.padCommandTime = 0, 0
 	e.padCommands = make(chan padPlayback, 32)
@@ -226,12 +231,13 @@ func (e *engine) begin(c settings, mode string) error {
 
 func (e *engine) startInput() error {
 	e.mu.Lock()
-	ctx, device, audio := e.ctx, e.cfg.DeviceID, e.audio
+	ctx, device, audio, voice := e.ctx, e.cfg.DeviceID, e.audio, e.voice
 	e.mu.Unlock()
 	ready := make(chan error, 1)
 	go e.processAudio(ctx, audio)
 	go func() {
 		err := e.capture(ctx, device, ready, func(p packet) error {
+			voice.enqueue(p)
 			e.inputMu.Lock()
 			defer e.inputMu.Unlock()
 			if ctx.Err() != nil {
@@ -334,6 +340,20 @@ func (e *engine) host(c settings) error {
 	e.listener = ln
 	ctx := e.ctx
 	e.mu.Unlock()
+	udpAddress, err := net.ResolveUDPAddr("udp", ln.Addr().String())
+	if err != nil {
+		e.disconnect()
+		return err
+	}
+	udp, err := net.ListenUDP("udp", udpAddress)
+	if err != nil {
+		e.disconnect()
+		return fmt.Errorf("голосовой UDP-порт: %w", err)
+	}
+	if err = e.startVoice(udp, nil, 0, [32]byte{}); err != nil {
+		e.disconnect()
+		return err
+	}
 	if err = e.startInput(); err != nil {
 		e.disconnect()
 		return err
@@ -374,8 +394,8 @@ func (e *engine) join(c settings) error {
 	e.client = w
 	ctx := e.ctx
 	e.mu.Unlock()
+	var reply message
 	if err = w.send(message{Type: "hello", Version: protocolVersion, Name: c.Name, Key: c.Key, CorrectionMS: c.CorrectionMS}); err == nil {
-		var reply message
 		reply, err = w.receive()
 		if err == nil && reply.Type != "welcome" {
 			err = fmt.Errorf("хост: %s", reply.Error)
@@ -388,6 +408,28 @@ func (e *engine) join(c settings) error {
 		e.disconnect()
 		return err
 	}
+	tokenBytes, tokenErr := hex.DecodeString(reply.VoiceToken)
+	if tokenErr != nil || len(tokenBytes) != 32 || reply.Source == 0 {
+		e.disconnect()
+		return fmt.Errorf("неверные параметры голосовой связи")
+	}
+	var token [32]byte
+	copy(token[:], tokenBytes)
+	remote := conn.RemoteAddr().(*net.TCPAddr)
+	server := &net.UDPAddr{IP: remote.IP, Port: remote.Port, Zone: remote.Zone}
+	network := "udp4"
+	if remote.IP.To4() == nil {
+		network = "udp6"
+	}
+	udp, err := net.ListenUDP(network, nil)
+	if err != nil {
+		e.disconnect()
+		return err
+	}
+	if err = e.startVoice(udp, server, reply.Source, token); err != nil {
+		e.disconnect()
+		return err
+	}
 	if err = e.startInput(); err != nil {
 		e.disconnect()
 		return err
@@ -397,7 +439,7 @@ func (e *engine) join(c settings) error {
 		return err
 	}
 	e.mu.Lock()
-	e.status = "Подключено. Хост управляет началом и остановкой записи."
+	e.status = "Подключено. Голос включён; хост управляет записью."
 	e.mu.Unlock()
 	go e.readHost(ctx, w)
 	return nil
@@ -420,16 +462,29 @@ func (e *engine) servePeer(ctx context.Context, w *wire) {
 	}
 	e.mu.Lock()
 	valid := m.Type == "hello" && m.Version == protocolVersion && len(m.Name) > 0 && utf8.RuneCountInString(m.Name) <= 40 && !strings.ContainsAny(m.Name, "\x00\r\n") && m.CorrectionMS >= -2000 && m.CorrectionMS <= 2000 && subtle.ConstantTimeCompare([]byte(m.Key), []byte(e.cfg.Key)) == 1
-	if !valid || ctx.Err() != nil || e.rec != nil || e.exporting || len(e.peers) >= maxPeers {
+	if !valid || ctx.Err() != nil || e.voice == nil || e.voice.ctx.Err() != nil || e.rec != nil || e.exporting || len(e.peers) >= maxPeers {
 		e.mu.Unlock()
 		_ = w.send(message{Type: "error", Error: "Неверный ключ/версия, сессия уже записывается или заполнена. При несовпадении версий обновите CoopRecord на обоих ПК."})
 		return
 	}
 	e.nextPeer++
 	p := &peer{w: w, name: m.Name, correction: m.CorrectionMS, number: e.nextPeer}
+	var token [32]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		e.mu.Unlock()
+		return
+	}
+	voice := e.voice
+	voice.mu.Lock()
+	voice.peers[uint32(p.number)] = &voicePeer{token: token, ip: w.RemoteAddr().(*net.TCPAddr).IP}
+	voice.mu.Unlock()
 	e.peers[p] = true
 	e.mu.Unlock()
 	defer func() {
+		voice.mu.Lock()
+		delete(voice.peers, uint32(p.number))
+		delete(voice.streams, uint32(p.number))
+		voice.mu.Unlock()
 		e.mu.Lock()
 		delete(e.peers, p)
 		active := e.rec != nil && e.rec.tracks[p] != nil
@@ -445,7 +500,7 @@ func (e *engine) servePeer(ctx context.Context, w *wire) {
 			e.fail(fmt.Errorf("%s отключился; полученный звук сохранён", p.name))
 		}
 	}()
-	if w.send(message{Type: "welcome", Version: protocolVersion}) != nil {
+	if w.send(message{Type: "welcome", Version: protocolVersion, Source: uint32(p.number), VoiceToken: hex.EncodeToString(token[:])}) != nil {
 		return
 	}
 	pingCtx, cancel := context.WithCancel(ctx)
@@ -842,6 +897,13 @@ func (e *engine) stopRecording() error {
 }
 
 func (e *engine) disconnect() {
+	// Stop live transmission immediately, even if finalizing the recording takes time.
+	e.mu.Lock()
+	if e.voice != nil {
+		e.voice.close()
+		e.voice = nil
+	}
+	e.mu.Unlock()
 	_ = e.stopRecording()
 	e.mu.Lock()
 	defer e.mu.Unlock()

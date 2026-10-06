@@ -48,6 +48,7 @@ const (
 	idStatus
 	idRecover
 	idUpdate
+	idVoiceStatus
 )
 
 type winClass struct {
@@ -79,6 +80,7 @@ type windowUI struct {
 	padFiles               [padCount]string
 	padLabels              [padCount]string
 	lastPadStatus          string
+	lastVoiceStatus        string
 	hwnd, font, titleFont  uintptr
 	controls               map[int]uintptr
 	devices                []inputDevice
@@ -490,6 +492,10 @@ drained:
 		setText(u.controls[idStatus], status)
 		u.lastStatus = status
 	}
+	if v.VoiceStatus != u.lastVoiceStatus {
+		setText(u.controls[idVoiceStatus], v.VoiceStatus)
+		u.lastVoiceStatus = v.VoiceStatus
+	}
 	if v.People != u.lastPeople {
 		setText(u.controls[idPeople], v.People)
 		u.lastPeople = v.People
@@ -634,7 +640,8 @@ func main() {
 	u.button(idOpen, "Открыть папку", 515, 561, 185)
 	u.control(idStatus, "EDIT", "", 0x200844, 20, 601, 680, 46)
 	u.button(idRecover, "Восстановить WAV…", 20, 656, 195)
-	u.label("Для разговора используйте отдельный звонок и наушники.", 230, 662, 476)
+	u.label("Голос включён в сессии. Используйте наушники.", 230, 662, 476)
+	u.control(idVoiceStatus, "EDIT", "", 0x200844, 746, 480, 666, 60)
 	u.refreshDevices(c.DeviceID)
 	if err := u.applyPadKeys(); err != nil {
 		u.e.lastError = err.Error()

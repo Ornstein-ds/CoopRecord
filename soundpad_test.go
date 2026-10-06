@@ -27,7 +27,7 @@ func TestPadMP3(t *testing.T) {
 			if err := os.WriteFile(path, b, 0600); err != nil {
 				t.Fatal(err)
 			}
-			e := newEngine(syntheticCapture)
+			e := newTestEngine(syntheticCapture)
 			e.padDir = t.TempDir()
 			if err := e.preparePads([padCount]string{path}); err != nil {
 				t.Fatal(err)
@@ -85,7 +85,7 @@ func testPadFile(t *testing.T, dir string) string {
 func TestSoundpadSessionTransferPlaybackAndExport(t *testing.T) {
 	dir := t.TempDir()
 	path := testPadFile(t, dir)
-	host, guest := newEngine(syntheticCapture), newEngine(syntheticCapture)
+	host, guest := newTestEngine(syntheticCapture), newTestEngine(syntheticCapture)
 	defer host.disconnect()
 	defer guest.disconnect()
 	hostPlayed, guestPlayed := make(chan int64, 4), make(chan int64, 4)
@@ -223,7 +223,7 @@ func TestSoundpadValidation(t *testing.T) {
 			t.Fatal("accepted bad WAV")
 		}
 	}
-	e := newEngine(syntheticCapture)
+	e := newTestEngine(syntheticCapture)
 	e.padDir = t.TempDir()
 	infos := make([]padInfo, padCount)
 	infos[0] = padInfo{"sound", len(pcm), padHash(pcm)}
@@ -250,7 +250,7 @@ func TestSoundpadValidation(t *testing.T) {
 
 func TestSoundpadToggleSwitchAndRecording(t *testing.T) {
 	dir := t.TempDir()
-	host, guest := newEngine(syntheticCapture), newEngine(syntheticCapture)
+	host, guest := newTestEngine(syntheticCapture), newTestEngine(syntheticCapture)
 	defer host.disconnect()
 	defer guest.disconnect()
 	var active [2]atomic.Int32

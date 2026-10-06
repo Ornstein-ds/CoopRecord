@@ -302,8 +302,8 @@ func waitFor(t *testing.T, condition func() bool) {
 }
 
 func TestHostGuestEndToEndAndReconnect(t *testing.T) {
-	host := newEngine(syntheticCapture)
-	guest := newEngine(syntheticCapture)
+	host := newTestEngine(syntheticCapture)
+	guest := newTestEngine(syntheticCapture)
 	defer host.disconnect()
 	defer guest.disconnect()
 	c := settings{Name: "Хост", DeviceID: "test", Address: "127.0.0.1:0", Folder: t.TempDir(), Key: "test-session-key"}
@@ -313,14 +313,14 @@ func TestHostGuestEndToEndAndReconnect(t *testing.T) {
 	host.mu.Lock()
 	address := host.listener.Addr().String()
 	host.mu.Unlock()
-	secondHost := newEngine(syntheticCapture)
+	secondHost := newTestEngine(syntheticCapture)
 	c2 := c
 	c2.Address = address
 	if err := secondHost.host(c2); err == nil {
 		secondHost.disconnect()
 		t.Fatal("two hosts bound the same address")
 	}
-	bad := newEngine(syntheticCapture)
+	bad := newTestEngine(syntheticCapture)
 	badCfg := c2
 	badCfg.Key = "incorrect-key"
 	if err := bad.join(badCfg); err == nil {

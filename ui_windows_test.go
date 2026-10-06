@@ -17,7 +17,7 @@ func TestEditShortcutsAndConnectionFields(t *testing.T) {
 		t.Fatal("cannot create hidden test window")
 	}
 	defer call("DestroyWindow", parent)
-	u := &windowUI{hwnd: parent, controls: map[int]uintptr{}, scale: 1, e: newEngine(syntheticCapture), role: 1}
+	u := &windowUI{hwnd: parent, controls: map[int]uintptr{}, scale: 1, e: newTestEngine(syntheticCapture), role: 1}
 	for _, id := range []int{idName, idCorrection, idAddress, idKey, idFolder} {
 		u.edit(id, "", 0, 0, 200)
 		h := u.controls[id]

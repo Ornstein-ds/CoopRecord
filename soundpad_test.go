@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -11,6 +12,57 @@ import (
 	"testing"
 	"time"
 )
+
+func TestPadMP3(t *testing.T) {
+	for _, name := range []string{"tone-stereo", "tone-mono"} {
+		t.Run(name, func(t *testing.T) {
+			b, err := os.ReadFile(filepath.Join("testdata", name+".mp3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Empty ID3v2 tag plus uppercase extension exercises the host import path.
+			b = append([]byte{'I', 'D', '3', 4, 0, 0, 0, 0, 0, 0}, b...)
+			path := filepath.Join(t.TempDir(), name+".MP3")
+			if err := os.WriteFile(path, b, 0600); err != nil {
+				t.Fatal(err)
+			}
+			e := newEngine(syntheticCapture)
+			e.padDir = t.TempDir()
+			if err := e.preparePads([padCount]string{path}); err != nil {
+				t.Fatal(err)
+			}
+			clip := e.pads[0]
+			pcm, err := readPadPCM(e.padDir, 0, clip.Info)
+			if err != nil || !bytes.Equal(pcm, clip.PCM) || len(pcm) < sampleRate/2 || len(pcm) > sampleRate*7/10 {
+				t.Fatalf("bad MP3 import: %v, %d bytes", err, len(pcm))
+			}
+			// Check an interior 100 ms window, past encoder delay: frequency and mono gain.
+			energy, crossings := 0.0, 0
+			previous := int16(0)
+			for i := sampleRate / 10; i < sampleRate/5; i++ {
+				v := int16(binary.LittleEndian.Uint16(pcm[i*2:]))
+				energy += float64(v) * float64(v)
+				if previous < 0 && v >= 0 {
+					crossings++
+				}
+				previous = v
+			}
+			expectedRMS := 12000 / math.Sqrt2
+			if name == "tone-stereo" {
+				expectedRMS /= 2
+			}
+			rms := math.Sqrt(energy / (sampleRate / 10))
+			if crossings < 43 || crossings > 45 || math.Abs(rms-expectedRMS) > expectedRMS*0.15 {
+				t.Fatalf("bad tone: %d crossings, RMS %.0f want %.0f", crossings, rms, expectedRMS)
+			}
+			for _, bad := range [][]byte{nil, []byte("not MP3"), []byte("ID3\x04\x00\x00\x7f\x7f\x7f\x7f"), b[:len(b)/2], bytes.Repeat(b[10:], 500)} {
+				if _, err := decodePadMP3(bad); err == nil {
+					t.Fatal("accepted invalid or overlong MP3")
+				}
+			}
+		})
+	}
+}
 
 func testPadFile(t *testing.T, dir string) string {
 	t.Helper()

@@ -40,9 +40,9 @@ func (u *windowUI) chooseSound() string {
 		Reserved                     uintptr
 		Reserved2, FlagsEx           uint32
 	}
-	filter := utf16.Encode([]rune("WAV-файлы (*.wav)\x00*.wav\x00\x00"))
+	filter := utf16.Encode([]rune("Звуки (*.wav;*.mp3)\x00*.wav;*.mp3\x00WAV (*.wav)\x00*.wav\x00MP3 (*.mp3)\x00*.mp3\x00\x00"))
 	var file [32768]uint16
-	info := openFileName{Owner: u.hwnd, Filter: &filter[0], File: &file[0], MaxFile: uint32(len(file)), Title: wide("Звук для саундпада (WAV, до 2 минут)"), Flags: 0x1000 | 0x800 | 0x80000 | 0x8}
+	info := openFileName{Owner: u.hwnd, Filter: &filter[0], File: &file[0], MaxFile: uint32(len(file)), Title: wide("Звук для саундпада (WAV/MP3, до 2 минут)"), Flags: 0x1000 | 0x800 | 0x80000 | 0x8}
 	info.Size = uint32(unsafe.Sizeof(info))
 	ok, _, _ := syscall.NewLazyDLL("comdlg32.dll").NewProc("GetOpenFileNameW").Call(uintptr(unsafe.Pointer(&info)))
 	if ok == 0 {
@@ -54,11 +54,11 @@ func (u *windowUI) chooseSound() string {
 func (u *windowUI) createSoundpad(c settings) {
 	u.padFiles = c.PadFiles
 	u.label("Саундпад · 9 звуков для всей сессии", 746, 22, 660)
-	u.label("Хост выбирает WAV до создания сессии. Клавиши настраиваются на каждом ПК.", 746, 49, 675)
+	u.label("Хост выбирает WAV/MP3 до создания сессии. Клавиши — на каждом ПК.", 746, 49, 675)
 	for i := 0; i < padCount; i++ {
 		x, y := 746+(i%3)*222, 82+(i/3)*177
 		u.control(idPadFirst+i, "BUTTON", fmt.Sprintf("%d\r\nПусто", i+1), 0x10000|0x2000, x, y, 148, 148)
-		u.button(idPadLoadFirst+i, "WAV…", x+153, y, 64)
+		u.button(idPadLoadFirst+i, "Файл…", x+153, y, 64)
 		u.button(idPadClearFirst+i, "Убрать", x+153, y+35, 64)
 		u.label("Клавиша:", x+153, y+76, 66)
 		u.control(idPadKeyFirst+i, "msctls_hotkey32", "", 0x10000, x, y+151, 217, 23)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -12,6 +13,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/hajimehoshi/go-mp3"
 )
 
 const padCount = 9
@@ -59,6 +62,44 @@ func decodePadWAV(b []byte) ([]byte, error) {
 	if kind == 0xfffe && len(format) >= 40 {
 		kind = binary.LittleEndian.Uint16(format[24:])
 	}
+	return normalizePadPCM(data, kind, channels, rate, bits, align)
+}
+
+func decodePadMP3(b []byte) (pcm []byte, err error) {
+	// A malformed source must not let a decoder panic terminate the session UI.
+	defer func() {
+		if recover() != nil {
+			pcm, err = nil, fmt.Errorf("повреждённый MP3")
+		}
+	}()
+	// Validate ID3 length before the decoder allocates space for metadata.
+	if len(b) >= 10 && string(b[:3]) == "ID3" {
+		size := int(b[6])<<21 | int(b[7])<<14 | int(b[8])<<7 | int(b[9])
+		if (b[6]|b[7]|b[8]|b[9])&0x80 != 0 || size > len(b)-10 {
+			return nil, fmt.Errorf("повреждённый заголовок MP3 (ID3)")
+		}
+	}
+	d, err := mp3.NewDecoder(bytes.NewReader(b))
+	if err != nil {
+		return nil, fmt.Errorf("не удалось прочитать MP3: %w", err)
+	}
+	// The decoder always produces signed 16-bit stereo, including for mono inputs.
+	limit := int64(d.SampleRate()) * 4 * 120
+	if d.Length() > limit {
+		return nil, fmt.Errorf("MP3 длиннее 2 минут")
+	}
+	data, err := io.ReadAll(io.LimitReader(d, limit+1))
+	if err != nil {
+		return nil, fmt.Errorf("не удалось декодировать MP3: %w", err)
+	}
+	if int64(len(data)) > limit || int64(len(data)) != d.Length() {
+		return nil, fmt.Errorf("MP3 повреждён или длиннее 2 минут")
+	}
+	return normalizePadPCM(data, 1, 2, d.SampleRate(), 16, 4)
+}
+
+func normalizePadPCM(data []byte, kind uint16, channels, rate, bits, align int) ([]byte, error) {
+	bad := fmt.Errorf("нужен звук PCM 8/16/24/32 бит или float32, моно/стерео, не длиннее 2 минут")
 	if channels < 1 || channels > 2 || rate < 8000 || rate > 192000 || (kind != 1 && kind != 3) || (bits != 8 && bits != 16 && bits != 24 && bits != 32) || (kind == 3 && bits != 32) || align != channels*bits/8 || len(data)%align != 0 {
 		return nil, bad
 	}
@@ -125,7 +166,12 @@ func (e *engine) preparePads(paths [padCount]string) error {
 		if len(b) > 64<<20 {
 			return fmt.Errorf("пад %d: файл больше 64 МБ", i+1)
 		}
-		pcm, err := decodePadWAV(b)
+		var pcm []byte
+		if strings.EqualFold(filepath.Ext(path), ".mp3") {
+			pcm, err = decodePadMP3(b)
+		} else {
+			pcm, err = decodePadWAV(b)
+		}
 		if err != nil {
 			return fmt.Errorf("пад %d: %w", i+1, err)
 		}

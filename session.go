@@ -637,6 +637,9 @@ func (e *engine) readHost(ctx context.Context, w *wire) {
 }
 
 func (e *engine) startRecording() error {
+	// A pad request must finish scheduling before we test whether playback is idle.
+	e.padTriggerMu.Lock()
+	defer e.padTriggerMu.Unlock()
 	e.mu.Lock()
 	if e.mode != "host" || !e.inputReady || e.rec != nil || e.exporting || !e.padsReadyLocked() || e.padVoices > 0 {
 		e.mu.Unlock()

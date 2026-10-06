@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"io"
 	"math"
 	"net"
@@ -128,6 +130,141 @@ func TestWAVSynchronizationRecoveryAndMix(t *testing.T) {
 	}
 }
 
+// WASAPI QPC timestamps can jitter even when its PCM sample stream is continuous.
+// Keep both the stream and interpolation phase continuous across every packet seam.
+func TestContinuousAudioWithNoisyPacketTimestamps(t *testing.T) {
+	for _, noisy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("jitter=%v", noisy), func(t *testing.T) {
+			dir := t.TempDir()
+			const start = int64(100 * time.Second)
+			const phase = 0.25
+			const scale = 1.001
+			track := trackInfo{ID: "track-00", Name: "Test"}
+			m := manifest{Version: 1, Start: start, End: start + 2e9, Tracks: []trackInfo{track}}
+			w, err := newTrack(dir, track.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			value := func(i int) float64 { return math.Round(12000 + 6000*math.Sin(2*math.Pi*997*float64(i)/sampleRate)) }
+			jitter := []int64{600000, -600000, -600000, 600000}
+			for n := 0; n < 200; n++ {
+				pcm := make([]byte, 960)
+				for j := 0; j < 480; j++ {
+					binary.LittleEndian.PutUint16(pcm[j*2:], uint16(int16(value(n*480+j))))
+				}
+				stamp := start + int64(math.Round((phase+float64(n*480)*scale)*1e9/sampleRate))
+				if noisy {
+					stamp += jitter[n%len(jitter)]
+				}
+				if err = w.append(packet{Time: stamp, PCM: pcm}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err = w.close(); err != nil {
+				t.Fatal(err)
+			}
+			if err = saveManifest(dir, m); err != nil {
+				t.Fatal(err)
+			}
+			result, err := exportSession(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(result.Warnings) != 0 {
+				t.Fatalf("timestamp noise was treated as missing audio: %v", result.Warnings)
+			}
+			b, err := os.ReadFile(filepath.Join(dir, "mix.wav"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			maxError := 0.0
+			for i := 1; i < 2*sampleRate; i++ {
+				x := (float64(i) - phase) / scale
+				a := int(x)
+				want := value(a) + (value(a+1)-value(a))*(x-float64(a))
+				got := float64(int16(binary.LittleEndian.Uint16(b[44+i*2:])))
+				maxError = math.Max(maxError, math.Abs(got-want))
+			}
+			if maxError > 2 {
+				t.Fatalf("packet seams changed continuous audio: max error %.1f PCM units", maxError)
+			}
+		})
+	}
+}
+
+func TestCaptureTimelinePreservesRealGap(t *testing.T) {
+	dir := t.TempDir()
+	start := int64(100 * time.Second)
+	track := trackInfo{ID: "track-00", Name: "Test"}
+	m := manifest{Version: 1, Start: start, End: start + 600e6, Tracks: []trackInfo{track}, Warnings: []string{"capture warning", "Test: разрывы временных меток: 535"}}
+	w, err := newTrack(dir, track.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 40; i++ {
+		stamp := start + int64(i)*1e7
+		if i >= 20 {
+			stamp += 200e6
+		}
+		pcm := make([]byte, 960)
+		for j := 0; j < len(pcm); j += 2 {
+			binary.LittleEndian.PutUint16(pcm[j:], 10000)
+		}
+		if err = w.append(packet{Time: stamp, PCM: pcm}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = w.close(); err != nil {
+		t.Fatal(err)
+	}
+	if err = saveManifest(dir, m); err != nil {
+		t.Fatal(err)
+	}
+	result, err := exportSession(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Warnings) != 2 || result.Warnings[0] != "capture warning" || result.Warnings[1] != "Test: разрывы временных меток: 1" {
+		t.Fatalf("warnings: %v", result.Warnings)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "track-00.wav"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < sampleRate*6/10; i++ {
+		want := uint16(10000)
+		if i >= sampleRate/5 && i < sampleRate*2/5 {
+			want = 0
+		}
+		if got := binary.LittleEndian.Uint16(b[44+i*2:]); got != want {
+			t.Fatalf("real gap changed at sample %d: got %d, want %d", i, got, want)
+		}
+	}
+}
+
+// Optional read-only diagnostics: never renders or modifies the supplied session.
+func TestRecordedCaptureClock(t *testing.T) {
+	dir := os.Getenv("COOPRECORD_DIAGNOSE_SESSION")
+	if dir == "" {
+		t.Skip("opt-in read-only clock diagnostics")
+	}
+	for _, id := range []string{"track-00", "track-01"} {
+		f, err := os.Open(filepath.Join(dir, id+".capture"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		spans, err := captureTimeline(bufio.NewReader(f))
+		f.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(spans) != 1 {
+			t.Fatalf("%s: expected continuous recording, got %d spans", id, len(spans))
+		}
+		t.Logf("%s: %d continuous samples, clock rate %.9f, no false gaps", id, spans[0].to, spans[0].rate)
+	}
+}
+
 func syntheticCapture(ctx context.Context, _ string, ready chan<- error, emit func(packet) error, level *atomic.Int32) error {
 	ready <- nil
 	start := clockNow()
@@ -200,7 +337,22 @@ func TestHostGuestEndToEndAndReconnect(t *testing.T) {
 		if err := host.startRecording(); err != nil {
 			t.Fatal(err)
 		}
-		time.Sleep(1250 * time.Millisecond)
+		// Wait for captured audio, not an arbitrary timer: slow Windows disk flushes
+		// can delay the synthetic source while the test process is being scheduled.
+		waitFor(t, func() bool {
+			host.mu.Lock()
+			defer host.mu.Unlock()
+			r := host.rec
+			if r == nil || r.local.lastTime < r.m.Start+250e6 || clockNow()-r.local.lastTime > 30e6 {
+				return false
+			}
+			for _, w := range r.tracks {
+				if clockNow()-w.lastTime > 30e6 {
+					return false
+				}
+			}
+			return true
+		})
 		if err := host.stopRecording(); err != nil {
 			t.Fatal(err)
 		}

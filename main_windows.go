@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"unicode"
+	"unicode/utf16"
 	"unsafe"
 
 	"github.com/go-ole/go-ole"
@@ -81,6 +83,8 @@ type windowUI struct {
 	testCancel             context.CancelFunc
 	testDone               chan struct{}
 	lastStatus, lastPeople string
+	role                   int
+	connections            [2]struct{ address, key string }
 }
 
 func wide(s string) *uint16 { p, _ := syscall.UTF16PtrFromString(s); return p }
@@ -126,6 +130,47 @@ func (u *windowUI) button(id int, text string, x, y, w int) {
 func (u *windowUI) edit(id int, text string, x, y, w int) {
 	u.control(id, "EDIT", text, 0x10080, x, y, w, 24)
 	sendMessage.Call(u.controls[id], 0xC5, 1024, 0)
+}
+
+func previousWordStart(text string, caret uint32) uint32 {
+	units := utf16.Encode([]rune(text))
+	left := utf16.Decode(units[:min(int(caret), len(units))])
+	i := len(left)
+	for i > 0 && unicode.IsSpace(left[i-1]) {
+		i--
+	}
+	if i > 0 {
+		word := func(r rune) bool { return unicode.IsLetter(r) || unicode.IsNumber(r) || unicode.IsMark(r) || r == '_' }
+		kind := word(left[i-1])
+		for i > 0 && !unicode.IsSpace(left[i-1]) && word(left[i-1]) == kind {
+			i--
+		}
+	}
+	return uint32(len(utf16.Encode(left[:i])))
+}
+
+func (u *windowUI) editShortcut(hwnd, key uintptr) bool {
+	if key != 'A' && key != 8 {
+		return false
+	}
+	for _, id := range []int{idName, idCorrection, idAddress, idKey, idFolder} {
+		if hwnd == 0 || hwnd != u.controls[id] {
+			continue
+		}
+		if key == 'A' {
+			sendMessage.Call(hwnd, 0xB1, 0, ^uintptr(0))
+			return true
+		} // EM_SETSEL
+		var start, end uint32
+		sendMessage.Call(hwnd, 0xB0, uintptr(unsafe.Pointer(&start)), uintptr(unsafe.Pointer(&end))) // EM_GETSEL
+		if start == end {
+			start = previousWordStart(getText(hwnd), start)
+		}
+		sendMessage.Call(hwnd, 0xB1, uintptr(start), uintptr(end))
+		sendMessage.Call(hwnd, 0xC2, 1, uintptr(unsafe.Pointer(wide("")))) // EM_REPLACESEL, undoable
+		return true
+	}
+	return false
 }
 func (u *windowUI) combo(id int, items []string, x, y, w int) {
 	h := u.control(id, "COMBOBOX", "", 0x210003, x, y, w, 200)
@@ -268,14 +313,15 @@ func (u *windowUI) chooseFolder(title string) string {
 }
 func (u *windowUI) command(id int, notification int) {
 	if id == idRole && notification == 1 {
-		host := selected(u.controls[idRole]) == 0
-		if host {
-			setText(u.controls[idAddress], "0.0.0.0:"+defaultPort)
-			setText(u.controls[idKey], sessionKey())
-		} else {
-			setText(u.controls[idAddress], "26.0.0.1:"+defaultPort)
-			setText(u.controls[idKey], "")
+		role := selected(u.controls[idRole])
+		if u.busy || role < 0 || role > 1 || role == u.role {
+			return
 		}
+		u.connections[u.role].address = getText(u.controls[idAddress])
+		u.connections[u.role].key = getText(u.controls[idKey])
+		u.role = role
+		setText(u.controls[idAddress], u.connections[role].address)
+		setText(u.controls[idKey], u.connections[role].key)
 		u.update()
 		return
 	}
@@ -496,6 +542,10 @@ func main() {
 	u.label("Совместная запись подкаста  ·  WAV 48 кГц / 16 бит  ·  Windows x64", 24, 47, 680)
 	u.control(0, "BUTTON", "1. Ваш звук", 7, 20, 78, 680, 143)
 	c := loadSettings()
+	u.role = c.Role
+	u.connections[0].address, u.connections[0].key = "0.0.0.0:"+defaultPort, sessionKey()
+	u.connections[1].address = "26.0.0.1:" + defaultPort
+	u.connections[c.Role].address, u.connections[c.Role].key = c.Address, c.Key
 	u.label("Ваше имя:", 34, 106, 103)
 	u.edit(idName, c.Name, 145, 101, 240)
 	u.label("Поправка, мс:", 433, 106, 110)
@@ -541,6 +591,10 @@ func main() {
 		n := call("GetMessageW", uintptr(unsafe.Pointer(&m)), 0, 0, 0)
 		if int32(n) <= 0 {
 			break
+		}
+		// Handle these before TranslateMessage so Ctrl+Backspace cannot insert DEL.
+		if m.Message == 0x100 && call("GetKeyState", 0x11)&0x8000 != 0 && call("GetKeyState", 0x12)&0x8000 == 0 && u.editShortcut(m.Window, m.WParam) {
+			continue
 		}
 		if call("IsDialogMessageW", u.hwnd, uintptr(unsafe.Pointer(&m))) == 0 {
 			call("TranslateMessage", uintptr(unsafe.Pointer(&m)))

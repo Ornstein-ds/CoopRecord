@@ -195,6 +195,73 @@ func writeSilence(w io.Writer, n int64) error {
 	return nil
 }
 
+type captureSpan struct {
+	from, to, time int64
+	offset, rate   float64
+}
+
+// Fit the audio clock to cumulative sample positions, never to adjacent packets.
+// ponytail: one constant sample rate per uninterrupted span; use slow clock tracking
+// if long recordings demonstrate nonlinear device-clock drift.
+func captureTimeline(r io.Reader) ([]captureSpan, error) {
+	var spans []captureSpan
+	var span captureSpan
+	var samples, lastTime, lastFrames int64
+	var count, meanX, meanY, xx, xy float64
+	finish := func() error {
+		span.to = samples
+		span.rate = 1
+		if xx > 0 {
+			span.rate = xy / xx
+		}
+		if span.rate < 0.98 || span.rate > 1.02 {
+			return fmt.Errorf("недостоверная частота аудиочасов")
+		}
+		span.offset = meanY - span.rate*meanX
+		spans = append(spans, span)
+		return nil
+	}
+	for {
+		p, err := readPacket(r)
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if lastTime != 0 && p.Time <= lastTime {
+			return nil, fmt.Errorf("неупорядоченные аудиоблоки")
+		}
+		// Preserve large discontinuities instead of stretching audio across missing time.
+		// Capture normally stops on a WASAPI discontinuity; sub-ms QPC noise is not one.
+		if count > 0 && abs64(p.Time-lastTime-lastFrames*1e9/sampleRate) > int64(50*time.Millisecond) {
+			if err = finish(); err != nil {
+				return nil, err
+			}
+			count, meanX, meanY, xx, xy = 0, 0, 0, 0, 0
+		}
+		if count == 0 {
+			span = captureSpan{from: samples, time: p.Time}
+		}
+		x := float64(samples - span.from)
+		y := float64(p.Time-span.time) * sampleRate / 1e9
+		count++
+		dx, dy := x-meanX, y-meanY
+		meanX += dx / count
+		meanY += dy / count
+		xx += dx * (x - meanX)
+		xy += dx * (y - meanY)
+		lastTime, lastFrames = p.Time, int64(len(p.PCM)/2)
+		samples += lastFrames
+	}
+	if count > 0 {
+		if err := finish(); err != nil {
+			return nil, err
+		}
+	}
+	return spans, nil
+}
+
 func renderTrack(dir string, t trackInfo, m manifest, total int64) (warnings []string, err error) {
 	anchors, err := readClocks(dir, t)
 	if err != nil {
@@ -206,14 +273,24 @@ func renderTrack(dir string, t trackInfo, m manifest, total int64) (warnings []s
 	}
 	defer f.Close()
 	r := bufio.NewReaderSize(f, 128*1024)
-	position := func(p packet) float64 {
-		return float64(mapClock(p.Time, anchors)+int64(t.CorrectionMS)*int64(time.Millisecond)-m.Start) * sampleRate / 1e9
+	spans, err := captureTimeline(r)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = f.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	r.Reset(f)
+	position := func(sample int64, span captureSpan) float64 {
+		stamp := span.time + int64(math.Round((span.offset+float64(sample-span.from)*span.rate)*1e9/sampleRate))
+		return float64(mapClock(stamp, anchors)+int64(t.CorrectionMS)*int64(time.Millisecond)-m.Start) * sampleRate / 1e9
 	}
 	err = writeWAV(filepath.Join(dir, t.ID+".wav"), total, func(w io.Writer) error {
 		p, e := readPacket(r)
 		cursor := int64(0)
 		count := 0
-		gaps := 0
+		spanIndex := 0
+		inputSample := int64(0)
 		firstAudio := int64(-1)
 		lastAudio := int64(0)
 		for e == nil {
@@ -221,19 +298,20 @@ func renderTrack(dir string, t trackInfo, m manifest, total int64) (warnings []s
 			if nextErr == nil && next.Time <= p.Time {
 				return fmt.Errorf("неупорядоченные аудиоблоки")
 			}
-			start := position(p)
 			frames := len(p.PCM) / 2
-			end := start + float64(frames)
-			if nextErr == nil {
-				delta := position(next) - start
-				if math.Abs(delta-float64(frames)) <= float64(frames)*0.02 {
-					end = start + delta
-				} else {
-					gaps++
-				}
+			for spanIndex+1 < len(spans) && inputSample >= spans[spanIndex].to {
+				spanIndex++
 			}
-			first := max(cursor, max(int64(0), int64(math.Round(start))))
-			last := min(total, int64(math.Round(end)))
+			span := spans[spanIndex]
+			start := position(inputSample, span)
+			end := position(inputSample+int64(frames), span)
+			if end <= start {
+				return fmt.Errorf("неупорядоченные метки синхронизации")
+			}
+			// Ceil assigns each output sample to exactly one packet and keeps its
+			// interpolation phase. Round used to clamp/repeat a sample at each seam.
+			first := max(cursor, max(int64(0), int64(math.Ceil(start))))
+			last := min(total, int64(math.Ceil(end)))
 			if first > total {
 				first = total
 			}
@@ -256,7 +334,7 @@ func renderTrack(dir string, t trackInfo, m manifest, total int64) (warnings []s
 					v2 := v
 					if a+1 < frames {
 						v2 = float64(int16(binary.LittleEndian.Uint16(p.PCM[(a+1)*2:])))
-					} else if nextErr == nil && gaps == 0 {
+					} else if nextErr == nil && inputSample+int64(frames) < span.to {
 						v2 = float64(int16(binary.LittleEndian.Uint16(next.PCM)))
 					}
 					value := int16(math.Round(max(-32768, min(32767, v+(v2-v)*fraction))))
@@ -269,6 +347,7 @@ func renderTrack(dir string, t trackInfo, m manifest, total int64) (warnings []s
 				lastAudio = last
 			}
 			count++
+			inputSample += int64(frames)
 			p = next
 			e = nextErr
 		}
@@ -287,8 +366,8 @@ func renderTrack(dir string, t trackInfo, m manifest, total int64) (warnings []s
 		if total-lastAudio > sampleRate/10 {
 			warnings = append(warnings, t.Name+": в конце дорожки не хватает более 100 мс аудио")
 		}
-		if gaps > 0 {
-			warnings = append(warnings, fmt.Sprintf("%s: разрывы временных меток: %d", t.Name, gaps))
+		if len(spans) > 1 {
+			warnings = append(warnings, fmt.Sprintf("%s: разрывы временных меток: %d", t.Name, len(spans)-1))
 		}
 		return writeSilence(w, total-cursor)
 	})
@@ -387,6 +466,14 @@ func exportSession(dir string) (manifest, error) {
 	}
 	total := (m.End - m.Start) * sampleRate / 1e9
 	for _, t := range m.Tracks {
+		// Recompute this export diagnostic; old versions mistook timestamp noise for gaps.
+		kept := m.Warnings[:0]
+		for _, warning := range m.Warnings {
+			if !strings.HasPrefix(warning, t.Name+": разрывы временных меток:") {
+				kept = append(kept, warning)
+			}
+		}
+		m.Warnings = kept
 		warnings, e := renderTrack(dir, t, m, total)
 		if e != nil {
 			return m, e

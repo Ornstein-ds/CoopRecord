@@ -77,6 +77,19 @@ func TestVoiceSessionAllParticipants(t *testing.T) {
 		})
 	}
 	checkHeard([3]int32{6000, 5000, 3000}) // Each recipient hears everyone except themselves.
+	waitFor(t, func() bool {
+		return len(host.mixerStrips()) == 3 && len(engines[1].mixerStrips()) == 3 && len(engines[2].mixerStrips()) == 3
+	})
+	strips := engines[1].mixerStrips()
+	if strips[1].Name != "Host" || strips[2].Name != "Guest" {
+		t.Fatal("wrong mixer names", strips)
+	}
+	strips[1].Channel.volume.Store(50)
+	strips[2].Channel.volume.Store(0)
+	checkHeard([3]int32{6000, 500, 3000}) // Only this listener's mix changes, with no self-monitoring.
+	if strips[1].Channel.peak.Load() != 3 || strips[2].Channel.peak.Load() != 12 {
+		t.Fatal("input meters must remain active at half volume and mute")
+	}
 	entries, err := os.ReadDir(folder)
 	if err != nil || len(entries) != 0 {
 		t.Fatal("conversation created recording files", err)
@@ -104,7 +117,7 @@ func TestVoiceSessionAllParticipants(t *testing.T) {
 		}
 	}
 	host.mu.Unlock()
-	checkHeard([3]int32{6000, 5000, 3000})
+	checkHeard([3]int32{6000, 500, 3000})
 	time.Sleep(150 * time.Millisecond)
 	if err := host.stopRecording(); err != nil {
 		t.Fatal(err)
@@ -120,6 +133,8 @@ func TestVoiceSessionAllParticipants(t *testing.T) {
 		}
 	}
 	// Check fresh output after stop, not a value left over from before it.
+	strips[1].Channel.volume.Store(100)
+	strips[2].Channel.volume.Store(100)
 	for i := range heard {
 		heard[i].Store(-1)
 	}
@@ -127,6 +142,10 @@ func TestVoiceSessionAllParticipants(t *testing.T) {
 	old := engines[2].voice
 	engines[2].disconnect()
 	waitFor(t, func() bool { return heard[0].Load() == 2000 && heard[1].Load() == 1000 })
+	waitFor(t, func() bool { return len(host.mixerStrips()) == 2 && len(engines[1].mixerStrips()) == 2 })
+	if engines[1].mixerStrips()[1].Channel != strips[1].Channel {
+		t.Fatal("surviving channel lost its controls")
+	}
 	if old.ctx.Err() == nil {
 		t.Fatal("voice survived disconnect")
 	}
@@ -134,6 +153,10 @@ func TestVoiceSessionAllParticipants(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkHeard([3]int32{6000, 5000, 3000})
+	waitFor(t, func() bool { return len(engines[1].mixerStrips()) == 3 })
+	if engines[1].mixerStrips()[2].Channel == strips[2].Channel {
+		t.Fatal("reconnected guest retained old channel")
+	}
 	v := engines[2].voice
 	bad := make([]byte, voicePacketSize)
 	copy(bad, "CRV5")

@@ -4,10 +4,47 @@ package main
 
 import (
 	"runtime"
+	"syscall"
 	"testing"
 	"unicode/utf16"
 	"unsafe"
 )
+
+func TestMixerControls(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	syscall.NewLazyDLL("comctl32.dll").NewProc("InitCommonControls").Call()
+	parent := call("CreateWindowExW", 0, uintptr(unsafe.Pointer(wide("STATIC"))), 0, 0, 0, 0, 1440, 1035, 0, 0, 0, 0)
+	if parent == 0 {
+		t.Fatal("cannot create test window")
+	}
+	defer call("DestroyWindow", parent)
+	u := &windowUI{hwnd: parent, controls: map[int]uintptr{}, scale: 1, e: newTestEngine(syntheticCapture)}
+	u.createMixer()
+	u.updateMixer()
+	h := u.controls[idMixerFirst+1]
+	if h == 0 {
+		t.Fatal("no native fader")
+	}
+	for _, position := range []uintptr{0, 25, 100} {
+		sendMessage.Call(h, 0x405, 1, position)
+		u.mixerScroll(h)
+		if got := u.e.padMixer.volume.Load(); got != int32(100-position) {
+			t.Fatal("fader direction/gain", got)
+		}
+	}
+	u.e.padMixer.meter(75)
+	u.updateMixer()
+	n, _, _ := sendMessage.Call(u.controls[idMixerFirst+2], 0x408, 0, 0)
+	if n != 75 {
+		t.Fatal("meter position", n)
+	}
+	u.updateMixer()
+	n, _, _ = sendMessage.Call(u.controls[idMixerFirst+2], 0x408, 0, 0)
+	if n != 0 {
+		t.Fatal("silent meter retained stale peak", n)
+	}
+}
 
 func TestEditShortcutsAndConnectionFields(t *testing.T) {
 	runtime.LockOSThread()

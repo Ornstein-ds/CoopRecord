@@ -444,9 +444,19 @@ func TestSoundpadPlaybackSmoke(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if err := playPadPCM(ctx, make([]byte, sampleRate/5), clockNow()+300e6); err != nil {
+	channel := newMixerChannel()
+	changed := make(chan struct{})
+	go func() {
+		defer close(changed)
+		for _, volume := range []int32{0, 25, 100} {
+			time.Sleep(40 * time.Millisecond)
+			channel.volume.Store(volume)
+		}
+	}()
+	if err := playPadMixed(ctx, make([]byte, sampleRate/2), clockNow()+20e6, channel); err != nil {
 		t.Fatal(err)
 	}
+	<-changed
 	// Cancel an output buffer that is already playing, not only a queued start.
 	playing, stop := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer stop()

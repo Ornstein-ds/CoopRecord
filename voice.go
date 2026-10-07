@@ -49,6 +49,8 @@ type voiceSession struct {
 	mu          sync.Mutex
 	peers       map[uint32]*voicePeer
 	streams     map[uint32]*voiceStream
+	members     []rosterMember
+	channels    map[uint32]*mixerChannel
 	lastReceive time.Time
 	problem     string
 }
@@ -257,6 +259,12 @@ func (v *voiceSession) fill(out []byte) {
 	now := time.Now()
 	sums := make([]float64, len(out)/2)
 	for id, s := range v.streams {
+		channel := v.channels[id]
+		gain := 1.0
+		if channel != nil {
+			gain = float64(channel.volume.Load()) / 100
+		}
+		peak := 0.0
 		if now.Sub(s.last) > time.Second {
 			delete(v.streams, id)
 			continue
@@ -282,8 +290,13 @@ func (v *voiceSession) fill(out []byte) {
 			}
 			frame := int64(s.cursor)
 			a, b := s.sample(frame), s.sample(frame+1)
-			sums[i] += a + (b-a)*(s.cursor-float64(frame))
+			value := a + (b-a)*(s.cursor-float64(frame))
+			peak = max(peak, math.Abs(value))
+			sums[i] += value * gain
 			s.cursor += step
+		}
+		if channel != nil {
+			channel.meter(int32(peak * 100 / 32768))
 		}
 	}
 	for i, value := range sums {

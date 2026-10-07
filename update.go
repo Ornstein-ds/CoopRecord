@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-const appVersion = "3.0.1"
+const appVersion = "4.0.1"
 const releaseAPI = "https://api.github.com/repos/Ornstein-ds/CoopRecord/releases/latest"
 const updateArchive = "CoopRecord-windows-x64.zip"
 const maxUpdateSize = 64 << 20

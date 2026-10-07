@@ -55,6 +55,8 @@ type audioEvent struct {
 }
 type captureFunc func(context.Context, string, chan<- error, func(packet) error, *atomic.Int32) error
 type engine struct {
+	padMixer                 *mixerChannel
+	rosterMu                 sync.Mutex
 	voice                    *voiceSession
 	voiceOutput              func(context.Context, chan<- error, func([]byte)) error
 	padTriggerMu             sync.Mutex
@@ -99,7 +101,11 @@ type viewState struct {
 }
 
 func newEngine(capture captureFunc) *engine {
-	return &engine{capture: capture, playPad: playPadPCM, voiceOutput: renderVoice, status: "Выберите микрофон и роль сессии."}
+	e := &engine{capture: capture, padMixer: newMixerChannel(), voiceOutput: renderVoice, status: "Выберите микрофон и роль сессии."}
+	e.playPad = func(ctx context.Context, pcm []byte, start int64) error {
+		return playPadMixed(ctx, pcm, start, e.padMixer)
+	}
+	return e
 }
 func (e *engine) snapshot() viewState {
 	e.mu.Lock()
@@ -461,7 +467,7 @@ func (e *engine) servePeer(ctx context.Context, w *wire) {
 		return
 	}
 	e.mu.Lock()
-	valid := m.Type == "hello" && m.Version == protocolVersion && len(m.Name) > 0 && utf8.RuneCountInString(m.Name) <= 40 && !strings.ContainsAny(m.Name, "\x00\r\n") && m.CorrectionMS >= -2000 && m.CorrectionMS <= 2000 && subtle.ConstantTimeCompare([]byte(m.Key), []byte(e.cfg.Key)) == 1
+	valid := m.Type == "hello" && m.Version == protocolVersion && strings.TrimSpace(m.Name) != "" && utf8.RuneCountInString(m.Name) <= 40 && !strings.ContainsAny(m.Name, "\x00\r\n") && m.CorrectionMS >= -2000 && m.CorrectionMS <= 2000 && subtle.ConstantTimeCompare([]byte(m.Key), []byte(e.cfg.Key)) == 1
 	if !valid || ctx.Err() != nil || e.voice == nil || e.voice.ctx.Err() != nil || e.rec != nil || e.exporting || len(e.peers) >= maxPeers {
 		e.mu.Unlock()
 		_ = w.send(message{Type: "error", Error: "Неверный ключ/версия, сессия уже записывается или заполнена. При несовпадении версий обновите CoopRecord на обоих ПК."})
@@ -499,6 +505,7 @@ func (e *engine) servePeer(ctx context.Context, w *wire) {
 		if active && ctx.Err() == nil {
 			e.fail(fmt.Errorf("%s отключился; полученный звук сохранён", p.name))
 		}
+		e.broadcastRoster(ctx)
 	}()
 	if w.send(message{Type: "welcome", Version: protocolVersion, Source: uint32(p.number), VoiceToken: hex.EncodeToString(token[:])}) != nil {
 		return
@@ -582,6 +589,9 @@ func (e *engine) servePeer(ctx context.Context, w *wire) {
 			e.fail(err)
 			return
 		}
+		if m.Type == "ready" {
+			e.broadcastRoster(ctx)
+		}
 	}
 }
 func abs64(n int64) int64 {
@@ -635,6 +645,13 @@ func (e *engine) readHost(ctx context.Context, w *wire) {
 			return
 		}
 		switch m.Type {
+		case "roster":
+			e.mu.Lock()
+			v := e.voice
+			e.mu.Unlock()
+			if v != nil && ctx.Err() == nil {
+				err = v.setRoster(m.Members)
+			}
 		case "pads_begin", "pad_chunk", "pads_end":
 			err = e.receivePads(ctx, w, m)
 		case "pad_notice":

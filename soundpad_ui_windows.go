@@ -53,10 +53,10 @@ func (u *windowUI) chooseSound() string {
 
 func (u *windowUI) createSoundpad(c settings) {
 	u.padFiles = c.PadFiles
-	u.label("Саундпад · 9 звуков для всей сессии", 746, 22, 660)
-	u.label("Хост выбирает WAV/MP3 до создания сессии. Клавиши — на каждом ПК.", 746, 49, 675)
+	u.label("Саундпад · звуки для всей сессии · необязательно", 746, 141, 660)
+	u.label("WAV/MP3 выбирает хост. Нажмите звучащий пад ещё раз, чтобы остановить.", 746, 166, 675)
 	for i := 0; i < padCount; i++ {
-		x, y := 746+(i%3)*170, 82+(i/3)*125
+		x, y := 746+(i%3)*220, 194+(i/3)*125
 		u.control(idPadFirst+i, "BUTTON", fmt.Sprintf("%d\r\nПусто", i+1), 0x10000|0x2000, x, y, 96, 96)
 		u.button(idPadLoadFirst+i, "Файл…", x+101, y, 64)
 		u.button(idPadClearFirst+i, "Убрать", x+101, y+35, 64)
@@ -131,7 +131,11 @@ func (u *windowUI) savePadSettings() error {
 	c.PadFiles = u.padFiles
 	c.PadKeys = u.readPadKeys()
 	c.PadKeysSet = true
-	return saveSettings(c)
+	if err := saveSettings(c); err != nil {
+		return err
+	}
+	u.savedPadFiles = u.padFiles
+	return nil
 }
 
 func (u *windowUI) soundpadCommand(id int) bool {
@@ -153,6 +157,9 @@ func (u *windowUI) soundpadCommand(id int) bool {
 		}
 		if err != nil {
 			messageBox(u.hwnd, err.Error(), 0x30)
+		} else {
+			u.savedPadKeys = u.readPadKeys()
+			messageBox(u.hwnd, "Горячие клавиши применены и сохранены на этом компьютере.", 0x40)
 		}
 		return true
 	}
@@ -194,7 +201,7 @@ func (u *windowUI) updateSoundpad(v viewState) {
 			name = strings.TrimSuffix(filepath.Base(u.padFiles[i]), filepath.Ext(u.padFiles[i]))
 		}
 		if name == "" {
-			name = "Пусто"
+			name = "Нет звука"
 		}
 		text := fmt.Sprintf("%d\r\n%s", i+1, name)
 		if text != u.padLabels[i] {
@@ -204,11 +211,20 @@ func (u *windowUI) updateSoundpad(v viewState) {
 		enable(u.controls[idPadFirst+i], v.Mode != "" && v.PadsReady && v.Pads[i].Size > 0 && !u.busy && !v.Exporting)
 		edit := v.Mode == "" && selected(u.controls[idRole]) == 0 && !u.busy
 		enable(u.controls[idPadLoadFirst+i], edit)
-		enable(u.controls[idPadClearFirst+i], edit)
+		enable(u.controls[idPadClearFirst+i], edit && u.padFiles[i] != "")
+		enable(u.controls[idPadKeyFirst+i], !u.busy)
 	}
+	enable(u.controls[idPadApply], !u.busy && u.readPadKeys() != u.savedPadKeys)
 	sendMessage.Call(u.controls[idPadProgress], 0x402, uintptr(v.PadProgress), 0)
-	if v.PadStatus != u.lastPadStatus {
-		setText(u.controls[idPadStatus], v.PadStatus)
-		u.lastPadStatus = v.PadStatus
+	status := v.PadStatus
+	if v.Mode == "" {
+		status = "Хост может добавить звуки кнопкой «Файл…». Кнопки станут доступны в сессии."
+		if selected(u.controls[idRole]) == 1 {
+			status = "Звуки автоматически загрузятся после подключения к хосту."
+		}
+	}
+	if status != u.lastPadStatus {
+		setText(u.controls[idPadStatus], status)
+		u.lastPadStatus = status
 	}
 }

@@ -7,7 +7,7 @@ import "fmt"
 const idMixerFirst = 400
 
 func (u *windowUI) createMixer() {
-	u.control(0, "BUTTON", "5. Микшер — громкость в ваших наушниках", 7, 20, 700, 1400, 319)
+	u.control(0, "BUTTON", "Микшер — громкость в ваших наушниках", 7, 20, 700, 1400, 319)
 	u.label("На WAV-записи не влияет. Индикаторы показывают входной уровень дорожек, до фейдера. 100% — исходная громкость, 0% — без звука.", 34, 724, 1365)
 	for i := range u.mixerChannels {
 		x, id := 34+i*173, idMixerFirst+i*4

@@ -75,6 +75,7 @@ type uiResult struct {
 	testDone     chan struct{}
 	notice       string
 	downloadPath string
+	saved        bool
 }
 type windowUI struct {
 	mixerChannels          [maxPeers + 1]*mixerChannel
@@ -94,6 +95,12 @@ type windowUI struct {
 	lastStatus, lastPeople string
 	role                   int
 	connections            [2]struct{ address, key string }
+	primaryAction          int
+	micChecked             bool
+	draftReady             bool
+	savedDraft             formDraft
+	savedPadKeys           [padCount]uint16
+	savedPadFiles          [padCount]string
 }
 
 func wide(s string) *uint16 { p, _ := syscall.UTF16PtrFromString(s); return p }
@@ -170,6 +177,9 @@ func (u *windowUI) editShortcut(hwnd, key uintptr) bool {
 			sendMessage.Call(hwnd, 0xB1, 0, ^uintptr(0))
 			return true
 		} // EM_SETSEL
+		if call("GetWindowLongPtrW", hwnd, ^uintptr(15))&0x800 != 0 { // ES_READONLY
+			return true
+		}
 		var start, end uint32
 		sendMessage.Call(hwnd, 0xB0, uintptr(unsafe.Pointer(&start)), uintptr(unsafe.Pointer(&end))) // EM_GETSEL
 		if start == end {
@@ -239,10 +249,20 @@ func (u *windowUI) settings() (settings, error) {
 	if _, _, err = net.SplitHostPort(c.Address); err != nil {
 		return c, fmt.Errorf("адрес должен быть в формате IP:порт, например 26.1.2.3:%s", defaultPort)
 	}
+	if c.Role == 1 {
+		host, _, _ := net.SplitHostPort(c.Address)
+		if host == "" || (net.ParseIP(host) != nil && net.ParseIP(host).IsUnspecified()) {
+			return c, fmt.Errorf("введите IP хоста из RadminVPN вместо 0.0.0.0, например 26.1.2.3:%s", defaultPort)
+		}
+	}
+	if c.Role == 0 && strings.TrimSpace(c.Folder) == "" {
+		return c, fmt.Errorf("выберите папку, в которой хост сохранит записи")
+	}
 	return c, checkSettings(c)
 }
 
 func (u *windowUI) refreshDevices(wanted string) {
+	u.micChecked = false
 	d, err := inputDevices()
 	if err != nil {
 		messageBox(u.hwnd, "Не удалось получить микрофоны: "+err.Error(), 0x10)
@@ -286,7 +306,7 @@ func (u *windowUI) testMic() {
 	u.testDone = make(chan struct{})
 	done := u.testDone
 	id := u.devices[i].ID
-	setText(u.controls[idTest], "Остановить тест")
+	setText(u.controls[idTest], "Завершить проверку")
 	go func() {
 		ready := make(chan error, 1)
 		err := captureAudio(ctx, id, ready, func(packet) error { return nil }, &u.e.level)
@@ -324,6 +344,12 @@ func (u *windowUI) chooseFolder(title string) string {
 	return syscall.UTF16ToString(path[:])
 }
 func (u *windowUI) command(id int, notification int) {
+	if id == idMic && notification == 1 {
+		u.stopTest()
+		u.micChecked = false
+		u.update()
+		return
+	}
 	if id == idRole && notification == 1 {
 		role := selected(u.controls[idRole])
 		if u.busy || role < 0 || role > 1 || role == u.role {
@@ -344,6 +370,25 @@ func (u *windowUI) command(id int, notification int) {
 		return
 	}
 	switch id {
+	case idHelp:
+		messageBox(u.hwnd, connectionHelp, 0x40)
+	case idCorrectionHelp:
+		messageBox(u.hwnd, "Обычно оставляйте 0. Поправка сдвигает ваш микрофон в готовой записи: положительное значение — позже, отрицательное — раньше. Диапазон: от −2000 до 2000 мс. На голосовой разговор не влияет.", 0x40)
+	case idSaveSettings:
+		c, err := u.settings()
+		if err == nil {
+			err = u.applyPadKeys()
+		}
+		if err == nil {
+			err = saveSettings(c)
+		}
+		if err != nil {
+			messageBox(u.hwnd, err.Error(), 0x30)
+			return
+		}
+		u.savedDraft, u.savedPadKeys = u.draft(), u.readPadKeys()
+		u.savedPadFiles = u.padFiles
+		messageBox(u.hwnd, "Настройки сохранены. Ключ сессии действует только до закрытия приложения.", 0x40)
 	case idUpdate:
 		if u.e.snapshot().Mode != "" {
 			return
@@ -366,7 +411,13 @@ func (u *windowUI) command(id int, notification int) {
 	case idTest:
 		u.testMic()
 	case idNewKey:
-		setText(u.controls[idKey], sessionKey())
+		if u.e.snapshot().Mode != "" {
+			sendMessage.Call(u.controls[idKey], 0xB1, 0, ^uintptr(0)) // EM_SETSEL
+			sendMessage.Call(u.controls[idKey], 0x301, 0, 0)          // WM_COPY
+			call("SetFocus", u.controls[idKey])
+		} else {
+			setText(u.controls[idKey], sessionKey())
+		}
 	case idBrowse:
 		if p := u.chooseFolder("Куда сохранять записи подкаста?"); p != "" {
 			setText(u.controls[idFolder], p)
@@ -374,7 +425,14 @@ func (u *windowUI) command(id int, notification int) {
 	case idConnect:
 		u.stopTest()
 		if u.e.snapshot().Mode != "" {
-			if u.e.snapshot().Recording && messageBox(u.hwnd, "Остановить запись и отключиться?", 0x24) != 6 {
+			prompt := "Отключиться от сессии? Голосовая связь завершится."
+			if u.e.snapshot().Mode == "host" {
+				prompt = "Завершить сессию для всех участников? Голосовая связь завершится."
+			}
+			if u.e.snapshot().Recording {
+				prompt = "Отключиться во время записи? Текущая общая запись остановится. Хост сохранит полученный звук."
+			}
+			if messageBox(u.hwnd, prompt, 0x124) != 6 {
 				return
 			}
 			u.async(func() error { u.e.disconnect(); return nil }, false)
@@ -385,16 +443,26 @@ func (u *windowUI) command(id int, notification int) {
 			messageBox(u.hwnd, err.Error(), 0x30)
 			return
 		}
+		if err := u.applyPadKeys(); err != nil {
+			messageBox(u.hwnd, err.Error(), 0x30)
+			return
+		}
 		host := selected(u.controls[idRole]) == 0
-		u.async(func() error {
+		u.busy = true
+		u.update()
+		go func() {
 			if err := saveSettings(c); err != nil {
-				return err
+				u.results <- uiResult{err: err}
+				return
 			}
+			var err error
 			if host {
-				return u.e.host(c)
+				err = u.e.host(c)
+			} else {
+				err = u.e.join(c)
 			}
-			return u.e.join(c)
-		}, false)
+			u.results <- uiResult{err: err, saved: true}
+		}()
 	case idRecord:
 		u.async(u.e.startRecording, false)
 	case idStop:
@@ -429,6 +497,10 @@ func (u *windowUI) update() {
 	for {
 		select {
 		case result := <-u.results:
+			if result.saved {
+				u.savedDraft, u.savedPadKeys = u.draft(), u.readPadKeys()
+				u.savedPadFiles = u.padFiles
+			}
 			if result.notice != "" {
 				setText(u.controls[idUpdate], "Обновить приложение")
 				if result.err == nil {
@@ -463,12 +535,26 @@ drained:
 	u.updateMixer()
 	idle := v.Mode == "" && !u.busy
 	host := selected(u.controls[idRole]) == 0
-	for _, id := range []int{idName, idMic, idRefresh, idTest, idCorrection, idRole, idAddress, idKey} {
+	for _, id := range []int{idName, idMic, idRefresh, idTest, idCorrection, idRole} {
 		enable(u.controls[id], idle)
 	}
-	for _, id := range []int{idNewKey, idFolder, idBrowse} {
+	for _, id := range []int{idAddress, idKey} {
+		enable(u.controls[id], !u.busy)
+		readOnly := uintptr(1)
+		if idle {
+			readOnly = 0
+		}
+		sendMessage.Call(u.controls[id], 0xCF, readOnly, 0) // EM_SETREADONLY; allow copying in a session.
+	}
+	for _, id := range []int{idFolder, idBrowse} {
 		enable(u.controls[id], idle && host)
 	}
+	enable(u.controls[idNewKey], host && !u.busy)
+	keyAction := "Новый ключ"
+	if v.Mode != "" {
+		keyAction = "Скопировать ключ"
+	}
+	setChangedText(u.controls[idNewKey], keyAction)
 	enable(u.controls[idConnect], !u.busy && !v.Exporting)
 	enable(u.controls[idRecord], !u.busy && v.CanRecord)
 	enable(u.controls[idStop], !u.busy && v.Recording && v.Mode == "host")
@@ -480,8 +566,12 @@ drained:
 	}
 	if v.Mode != "" {
 		connect = "Отключиться"
+		if v.Mode == "host" {
+			connect = "Завершить сессию"
+		}
 	}
-	setText(u.controls[idConnect], connect)
+	setChangedText(u.controls[idConnect], connect)
+	u.updateGuidance(v, host)
 	sendMessage.Call(u.controls[idLevel], 0x402, uintptr(v.Level), 0)
 	status := v.Status
 	if v.Recording && v.Mode == "host" && !v.Exporting && !u.busy {
@@ -498,9 +588,13 @@ drained:
 		setText(u.controls[idVoiceStatus], v.VoiceStatus)
 		u.lastVoiceStatus = v.VoiceStatus
 	}
-	if v.People != u.lastPeople {
-		setText(u.controls[idPeople], v.People)
-		u.lastPeople = v.People
+	people := v.People
+	if people == "" {
+		people = "Здесь появятся участники и их готовность.\r\nСначала создайте сессию или подключитесь."
+	}
+	if people != u.lastPeople {
+		setText(u.controls[idPeople], people)
+		u.lastPeople = people
 	}
 	seconds := int(v.Elapsed.Seconds())
 	setText(u.controls[idTimer], fmt.Sprintf("%02d:%02d:%02d", seconds/3600, seconds/60%60, seconds%60))
@@ -509,6 +603,11 @@ drained:
 func windowProc(hwnd uintptr, msg uint32, w, l uintptr) uintptr {
 	u := appUI
 	switch msg {
+	case 0x400: // DM_GETDEFID: Enter follows the highlighted next action.
+		if u != nil && u.primaryAction != 0 && call("IsWindowEnabled", u.controls[u.primaryAction]) != 0 {
+			return 0x534b0000 | uintptr(u.primaryAction)
+		}
+		return 0
 	case 0x115: // WM_VSCROLL: native vertical trackbars, including keyboard changes.
 		if u != nil {
 			u.mixerScroll(l)
@@ -537,7 +636,19 @@ func windowProc(hwnd uintptr, msg uint32, w, l uintptr) uintptr {
 			messageBox(hwnd, "Дождитесь завершения текущей операции.", 0x40)
 			return 0
 		}
-		if u.e.snapshot().Recording && messageBox(hwnd, "Остановить запись, сохранить файлы и выйти?", 0x24) != 6 {
+		v := u.e.snapshot()
+		prompt := ""
+		if v.Recording {
+			prompt = "Закрыть приложение? Общая запись остановится; хост сохранит полученный звук."
+		} else if v.Mode == "host" {
+			prompt = "Закрыть приложение и завершить сессию для всех участников?"
+		} else if v.Mode != "" {
+			prompt = "Закрыть приложение и отключиться от голосовой связи?"
+		}
+		if u.hasDraftChanges() {
+			prompt += "\r\nЕсть несохранённые настройки или горячие клавиши. Чтобы сохранить их, отмените закрытие и нажмите «Сохранить настройки» или «Применить горячие клавиши». Закрыть без сохранения?"
+		}
+		if prompt != "" && messageBox(hwnd, strings.TrimSpace(prompt), 0x124) != 6 {
 			return 0
 		}
 		u.stopTest()
@@ -578,7 +689,7 @@ func main() {
 	dpi = uintptr(fit * 96)
 	u := &windowUI{controls: make(map[int]uintptr), e: newEngine(captureAudio), results: make(chan uiResult, 16), scale: float64(dpi) / 96}
 	appUI = u
-	fontHeight := int32(-13 * int(dpi) / 96)
+	fontHeight := int32(-14 * int(dpi) / 96)
 	u.font, _, _ = gdi32.NewProc("CreateFontW").Call(uintptr(fontHeight), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0, uintptr(unsafe.Pointer(wide("Segoe UI"))))
 	fontHeight = int32(-25 * int(dpi) / 96)
 	u.titleFont, _, _ = gdi32.NewProc("CreateFontW").Call(uintptr(fontHeight), 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 0, 0, uintptr(unsafe.Pointer(wide("Segoe UI"))))
@@ -601,63 +712,19 @@ func main() {
 		return
 	}
 	syscall.NewLazyDLL("comctl32.dll").NewProc("InitCommonControls").Call()
-	title := u.control(0, "STATIC", "CoopRecord", 0, 22, 12, 350, 34)
-	sendMessage.Call(title, 0x30, u.titleFont, 1)
-	u.label("v"+appVersion, 403, 23, 80)
-	u.button(idUpdate, "Обновить приложение", 505, 15, 195)
-	u.label("Совместная запись подкаста  ·  WAV 48 кГц / 16 бит  ·  Windows x64", 24, 47, 680)
-	u.control(0, "BUTTON", "1. Ваш звук", 7, 20, 78, 680, 143)
 	c := loadSettings()
-	u.createSoundpad(c)
-	u.createMixer()
-	u.role = c.Role
-	u.connections[0].address, u.connections[0].key = "0.0.0.0:"+defaultPort, sessionKey()
-	u.connections[1].address = "26.0.0.1:" + defaultPort
-	u.connections[c.Role].address, u.connections[c.Role].key = c.Address, c.Key
-	u.label("Ваше имя:", 34, 106, 103)
-	u.edit(idName, c.Name, 145, 101, 240)
-	u.label("Поправка, мс:", 433, 106, 110)
-	u.edit(idCorrection, strconv.Itoa(c.CorrectionMS), 554, 101, 128)
-	u.label("Микрофон:", 34, 143, 104)
-	u.combo(idMic, nil, 145, 137, 423)
-	u.button(idRefresh, "Обновить", 578, 135, 105)
-	u.button(idTest, "Проверить звук", 145, 178, 145)
-	u.control(idLevel, "msctls_progress32", "Уровень микрофона", 0, 304, 183, 230, 18)
-	u.label("Уровень сигнала", 550, 182, 140)
-	u.control(0, "BUTTON", "2. Сессия", 7, 20, 232, 680, 193)
-	u.label("Ваша роль:", 34, 261, 104)
-	u.combo(idRole, []string{"Хост — сохраняет файлы", "Участник — отправляет звук"}, 145, 254, 310)
-	sendMessage.Call(u.controls[idRole], 0x14e, uintptr(c.Role), 0)
-	u.label("Адрес:", 34, 299, 100)
-	u.edit(idAddress, c.Address, 145, 292, 310)
-	u.label("IP RadminVPN : порт", 472, 298, 213)
-	u.label("Ключ сессии:", 34, 336, 108)
-	u.edit(idKey, c.Key, 145, 330, 310)
-	u.button(idNewKey, "Новый ключ", 473, 328, 210)
-	u.label("Папка хоста:", 34, 377, 108)
-	u.edit(idFolder, c.Folder, 145, 371, 423)
-	u.button(idBrowse, "Обзор…", 578, 369, 105)
-	u.control(0, "BUTTON", "3. Участники и запись", 7, 20, 437, 680, 110)
-	u.control(idPeople, "EDIT", "", 0x200844, 34, 461, 390, 69)
-	timer := u.control(idTimer, "STATIC", "00:00:00", 0, 475, 461, 190, 36)
-	sendMessage.Call(timer, 0x30, u.titleFont, 1)
-	u.label("Начало и стоп — у хоста", 458, 506, 228)
-	u.button(idConnect, "Создать сессию", 20, 561, 175)
-	u.button(idRecord, "Начать запись", 205, 561, 170)
-	u.button(idStop, "Стоп", 385, 561, 120)
-	u.button(idOpen, "Открыть папку", 515, 561, 185)
-	u.control(idStatus, "EDIT", "", 0x200844, 20, 601, 680, 46)
-	u.button(idRecover, "Восстановить WAV…", 20, 656, 195)
-	u.label("Голос включён в сессии. Используйте наушники.", 230, 662, 476)
-	u.control(idVoiceStatus, "EDIT", "", 0x200844, 746, 480, 666, 60)
+	u.createControls(c)
 	u.refreshDevices(c.DeviceID)
 	if err := u.applyPadKeys(); err != nil {
 		u.e.lastError = err.Error()
 	}
+	u.savedDraft, u.savedPadKeys, u.draftReady = u.draft(), u.readPadKeys(), true
+	u.savedPadFiles = u.padFiles
 	u.update()
 	call("SetTimer", u.hwnd, 1, 150, 0)
 	call("ShowWindow", u.hwnd, 1)
 	call("UpdateWindow", u.hwnd)
+	call("SetFocus", u.controls[idName])
 	var m winMessage
 	for {
 		n := call("GetMessageW", uintptr(unsafe.Pointer(&m)), 0, 0, 0)
@@ -673,4 +740,62 @@ func main() {
 			call("DispatchMessageW", uintptr(unsafe.Pointer(&m)))
 		}
 	}
+}
+
+func (u *windowUI) createControls(c settings) {
+	title := u.control(0, "STATIC", "CoopRecord", 0, 22, 12, 350, 34)
+	sendMessage.Call(title, 0x30, u.titleFont, 1)
+	u.label("v"+appVersion, 270, 23, 100)
+	u.button(idHelp, "Как начать?", 390, 15, 105)
+	u.button(idUpdate, "Обновить приложение", 505, 15, 195)
+	u.label("Совместная запись подкаста  ·  WAV 48 кГц / 16 бит  ·  Windows x64", 24, 47, 680)
+	u.control(0, "BUTTON", "1. Ваш звук", 7, 20, 78, 680, 143)
+	u.role = c.Role
+	u.connections[0].address, u.connections[0].key = "0.0.0.0:"+defaultPort, sessionKey()
+	u.connections[1].address = "26.0.0.1:" + defaultPort
+	u.connections[c.Role].address, u.connections[c.Role].key = c.Address, c.Key
+	u.label("Ваше имя:", 34, 106, 103)
+	u.edit(idName, c.Name, 145, 101, 240)
+	u.label("Поправка, мс:", 433, 106, 110)
+	u.edit(idCorrection, strconv.Itoa(c.CorrectionMS), 554, 101, 80)
+	u.button(idCorrectionHelp, "?", 644, 99, 38)
+	u.label("Микрофон:", 34, 143, 104)
+	u.combo(idMic, nil, 145, 137, 423)
+	u.button(idRefresh, "Обновить", 578, 135, 105)
+	u.button(idTest, "Проверить звук", 34, 178, 180)
+	u.control(idLevel, "msctls_progress32", "Уровень микрофона", 0, 226, 183, 190, 18)
+	u.control(idMicHint, "STATIC", "", 0, 430, 177, 254, 38)
+	u.control(0, "BUTTON", "2. Сессия", 7, 20, 232, 680, 193)
+	u.label("Ваша роль:", 34, 261, 104)
+	u.combo(idRole, []string{"Хост — сохраняет файлы", "Участник — отправляет звук"}, 145, 254, 310)
+	sendMessage.Call(u.controls[idRole], 0x14e, uintptr(c.Role), 0)
+	u.control(idRoleHint, "STATIC", "", 0, 473, 254, 210, 34)
+	u.control(idAddressLabel, "STATIC", "", 0, 34, 299, 108, 21)
+	u.edit(idAddress, c.Address, 145, 292, 310)
+	u.control(idAddressHint, "STATIC", "", 0, 472, 298, 213, 24)
+	u.label("Ключ сессии:", 34, 336, 108)
+	u.edit(idKey, c.Key, 145, 330, 310)
+	u.button(idNewKey, "Новый ключ", 473, 328, 210)
+	u.label("Папка хоста:", 34, 377, 108)
+	u.edit(idFolder, c.Folder, 145, 371, 423)
+	u.button(idBrowse, "Обзор…", 578, 369, 105)
+	u.control(0, "BUTTON", "3. Участники и запись", 7, 20, 437, 680, 110)
+	u.control(idPeople, "EDIT", "", 0x200844, 34, 461, 390, 69)
+	timer := u.control(idTimer, "STATIC", "00:00:00", 0, 475, 461, 190, 36)
+	sendMessage.Call(timer, 0x30, u.titleFont, 1)
+	u.label("Начало и стоп — у хоста", 458, 506, 228)
+	u.button(idConnect, "Создать сессию", 20, 561, 175)
+	u.button(idRecord, "Начать запись", 205, 561, 300)
+	u.button(idStop, "Остановить и сохранить", 205, 561, 300)
+	u.button(idOpen, "Открыть папку", 515, 561, 185)
+	u.control(idStatus, "EDIT", "", 0x200844, 20, 601, 680, 46)
+	u.button(idRecover, "Восстановить WAV…", 20, 656, 195)
+	u.button(idSaveSettings, "Сохранить настройки", 230, 656, 200)
+	u.label("Используйте наушники", 450, 662, 250)
+	guide := u.control(idGuideTitle, "STATIC", "", 0, 746, 18, 666, 36)
+	sendMessage.Call(guide, 0x30, u.titleFont, 1)
+	u.control(idGuideDetail, "STATIC", "", 0, 746, 62, 650, 70)
+	u.control(idVoiceStatus, "EDIT", "", 0x200844, 746, 574, 666, 38)
+	u.createSoundpad(c)
+	u.createMixer()
 }

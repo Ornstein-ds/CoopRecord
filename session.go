@@ -89,6 +89,8 @@ type engine struct {
 	nextPeer                            int
 }
 type viewState struct {
+	RecordBlocked                       string
+	PeerCount                           int
 	VoiceStatus                         string
 	Pads                                [padCount]padInfo
 	PadProgress                         int
@@ -138,7 +140,18 @@ func (e *engine) snapshot() viewState {
 		v.PadStatus += "\r\nПеред началом записи дождитесь окончания звуков."
 	}
 	peers := e.sortedPeers()
+	v.PeerCount = len(peers)
+	if !e.inputReady {
+		v.RecordBlocked = "Микрофон ещё не готов. Дождитесь подключения звука."
+	} else if !e.padsReady {
+		v.RecordBlocked = "Звуки саундпада загружаются. Дождитесь готовности всех компьютеров."
+	} else if e.padVoices > 0 {
+		v.RecordBlocked = "Остановите звучащий пад повторным нажатием или дождитесь его окончания."
+	}
 	for _, p := range peers {
+		if !p.padsReady && v.RecordBlocked == "" {
+			v.RecordBlocked = "Звуки саундпада загружаются участникам. Дождитесь готовности всех компьютеров."
+		}
 		progress := percent(p.padBytes, p.padsReady)
 		v.PadProgress = min(v.PadProgress, progress)
 		v.PadStatus += fmt.Sprintf("\r\n%s: %d%%", p.name, progress)
@@ -152,6 +165,9 @@ func (e *engine) snapshot() viewState {
 			state = fmt.Sprintf("готов · RTT %.1f мс", float64(rtt)/1e6)
 		} else {
 			v.CanRecord = false
+			if v.RecordBlocked == "" {
+				v.RecordBlocked = "Проверяем микрофоны и синхронизируем часы участников. Дождитесь статуса «готов»."
+			}
 		}
 		v.People += p.name + " — " + state + "\r\n"
 	}

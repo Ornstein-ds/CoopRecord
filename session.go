@@ -19,6 +19,7 @@ import (
 )
 
 type settings struct {
+	Theme                                string `json:",omitempty"`
 	PadFiles                             [padCount]string
 	PadKeys                              [padCount]uint16
 	PadKeysSet                           bool
@@ -38,6 +39,8 @@ type peer struct {
 	number     int
 }
 type recording struct {
+	localDesktop  *trackWriter
+	desktopTracks map[*peer]*trackWriter
 	padEvents     *os.File
 	padEventCount int
 	dir, id       string
@@ -55,6 +58,12 @@ type audioEvent struct {
 }
 type captureFunc func(context.Context, string, chan<- error, func(packet) error, *atomic.Int32) error
 type engine struct {
+	desktopMixer             *mixerChannel
+	desktopMuted             atomic.Bool
+	desktopMu                sync.Mutex
+	desktopCancel            context.CancelFunc
+	desktopDone              chan struct{}
+	desktopCapture           captureFunc
 	padMixer                 *mixerChannel
 	rosterMu                 sync.Mutex
 	voice                    *voiceSession
@@ -101,7 +110,8 @@ type viewState struct {
 }
 
 func newEngine(capture captureFunc) *engine {
-	e := &engine{capture: capture, padMixer: newMixerChannel(), voiceOutput: renderVoice, status: "Выберите микрофон и роль сессии."}
+	e := &engine{capture: capture, padMixer: newMixerChannel(), desktopMixer: newMixerChannel(), desktopCapture: captureDesktop, voiceOutput: renderVoice, status: "Выберите микрофон и роль сессии."}
+	e.desktopMuted.Store(true)
 	e.playPad = func(ctx context.Context, pcm []byte, start int64) error {
 		return playPadMixed(ctx, pcm, start, e.padMixer)
 	}
@@ -299,7 +309,11 @@ func (e *engine) processAudio(ctx context.Context, audio <-chan audioEvent) {
 			w := e.client
 			var err error
 			if e.mode == "host" && e.rec != nil && item.session == e.rec.id && item.done == nil {
-				err = e.rec.local.append(item.packet)
+				track := e.rec.local
+				if item.packet.Desktop {
+					track = e.rec.localDesktop
+				}
+				err = track.append(item.packet)
 			}
 			if item.done != nil {
 				close(item.done)
@@ -307,7 +321,7 @@ func (e *engine) processAudio(ctx context.Context, audio <-chan audioEvent) {
 			e.mu.Unlock()
 			if w != nil && item.session != "" {
 				if item.done == nil {
-					err = w.send(message{Type: "audio", Session: item.session, Time: item.packet.Time, PCM: item.packet.PCM, Discontinuity: item.packet.Discontinuity})
+					err = w.send(message{Type: "audio", Session: item.session, Time: item.packet.Time, PCM: item.packet.PCM, Discontinuity: item.packet.Discontinuity, Desktop: item.packet.Desktop})
 				} else {
 					err = w.send(message{Type: "end", Session: item.session})
 				}
@@ -415,7 +429,7 @@ func (e *engine) join(c settings) error {
 		return err
 	}
 	tokenBytes, tokenErr := hex.DecodeString(reply.VoiceToken)
-	if tokenErr != nil || len(tokenBytes) != 32 || reply.Source == 0 {
+	if tokenErr != nil || len(tokenBytes) != 32 || reply.Source == 0 || reply.Source >= desktopSource {
 		e.disconnect()
 		return fmt.Errorf("неверные параметры голосовой связи")
 	}
@@ -490,6 +504,7 @@ func (e *engine) servePeer(ctx context.Context, w *wire) {
 		voice.mu.Lock()
 		delete(voice.peers, uint32(p.number))
 		delete(voice.streams, uint32(p.number))
+		delete(voice.streams, uint32(p.number)|desktopSource)
 		voice.mu.Unlock()
 		e.mu.Lock()
 		delete(e.peers, p)
@@ -529,6 +544,11 @@ func (e *engine) servePeer(ctx context.Context, w *wire) {
 		e.mu.Lock()
 		r := e.rec
 		switch m.Type {
+		case "desktop_error":
+			e.lastError = p.name + ": звук компьютера выключен: " + m.Error
+			if r != nil {
+				r.m.Warnings = append(r.m.Warnings, e.lastError)
+			}
 		case "pads_progress", "pads_ready":
 			if m.Offset < p.padBytes || m.Offset > e.padTotal || (m.Type == "pads_ready" && m.Offset != e.padTotal) {
 				err = fmt.Errorf("неверный прогресс саундпада")
@@ -552,6 +572,9 @@ func (e *engine) servePeer(ctx context.Context, w *wire) {
 					}
 					if r != nil && r.tracks[p] != nil {
 						err = r.tracks[p].clock(s)
+						if err == nil {
+							err = r.desktopTracks[p].clock(s)
+						}
 					}
 				}
 			}
@@ -568,7 +591,11 @@ func (e *engine) servePeer(ctx context.Context, w *wire) {
 					err = fmt.Errorf("аудиометка за пределами допустимого времени")
 				}
 				if err == nil {
-					err = r.tracks[p].append(packet{Time: m.Time, PCM: m.PCM, Discontinuity: m.Discontinuity})
+					track := r.tracks[p]
+					if m.Desktop {
+						track = r.desktopTracks[p]
+					}
+					err = track.append(packet{Time: m.Time, PCM: m.PCM, Discontinuity: m.Discontinuity})
 				}
 			}
 		case "end":
@@ -734,8 +761,8 @@ func (e *engine) startRecording() error {
 		e.mu.Unlock()
 		return err
 	}
-	r := &recording{dir: dir, id: filepath.Base(dir), tracks: make(map[*peer]*trackWriter), ended: make(map[*peer]chan struct{}), done: make(chan struct{})}
-	r.m = manifest{Version: 4, Created: time.Now().Format(time.RFC3339), Start: clockNow() + int64(time.Second)}
+	r := &recording{dir: dir, id: filepath.Base(dir), tracks: make(map[*peer]*trackWriter), desktopTracks: make(map[*peer]*trackWriter), ended: make(map[*peer]chan struct{}), done: make(chan struct{})}
+	r.m = manifest{Version: 5, Created: time.Now().Format(time.RFC3339), Start: clockNow() + int64(time.Second)}
 	r.m.Tracks = append(r.m.Tracks, trackInfo{ID: "track-00", Name: e.cfg.Name, CorrectionMS: e.cfg.CorrectionMS})
 	r.local, err = newTrack(dir, "track-00")
 	if err == nil {
@@ -760,6 +787,9 @@ func (e *engine) startRecording() error {
 		}
 	}
 	if err == nil {
+		err = r.prepareDesktopTracks(e.cfg.Name, ps)
+	}
+	if err == nil {
 		err = e.preparePadRecording(r)
 	}
 	if err == nil {
@@ -777,6 +807,7 @@ func (e *engine) startRecording() error {
 		for _, w := range r.tracks {
 			w.close()
 		}
+		r.closeDesktopTracks()
 		e.mu.Unlock()
 		return err
 	}
@@ -880,7 +911,7 @@ func (e *engine) stopRecording() error {
 			p.w.Close()
 		}
 	}
-	err := r.local.close()
+	err := errors.Join(r.local.close(), r.closeDesktopTracks())
 	if r.padEvents != nil {
 		err = errors.Join(err, r.padEvents.Sync(), r.padEvents.Close())
 	}
@@ -914,6 +945,7 @@ func (e *engine) stopRecording() error {
 }
 
 func (e *engine) disconnect() {
+	_ = e.setDesktopMuted(true)
 	// Stop live transmission immediately, even if finalizing the recording takes time.
 	e.mu.Lock()
 	if e.voice != nil {

@@ -28,6 +28,9 @@ func playPadPCM(ctx context.Context, pcm []byte, start int64) error {
 }
 
 func playPadMixed(ctx context.Context, pcm []byte, start int64, channel *mixerChannel) error {
+	if ctx.Err() != nil {
+		return nil
+	}
 	var handle uintptr
 	format := wca.WAVEFORMATEX{WFormatTag: 1, NChannels: 1, NSamplesPerSec: sampleRate, NAvgBytesPerSec: sampleRate * 2, NBlockAlign: 2, WBitsPerSample: 16}
 	r, _, _ := winmm.NewProc("waveOutOpen").Call(uintptr(unsafe.Pointer(&handle)), 0xffffffff, uintptr(unsafe.Pointer(&format)), 0, 0, 0)
@@ -41,10 +44,13 @@ func playPadMixed(ctx context.Context, pcm []byte, start int64, channel *mixerCh
 		return fmt.Errorf("команда воспроизведения пришла слишком поздно")
 	}
 	pcm = pcm[skip*2:]
-	header := waveHeader{Data: &pcm[0], Length: uint32(len(pcm))}
+	// Short queued buffers let gain exceed unity and change during playback.
+	var buffers [3]struct {
+		header waveHeader
+		data   [sampleRate * 2 / 50]byte // 20 ms
+		queued bool
+	}
 	var pin runtime.Pinner
-	pin.Pin(&pcm[0])
-	pin.Pin(&header)
 	defer pin.Unpin()
 	invoke := func(name string, args ...uintptr) error {
 		r, _, _ := winmm.NewProc(name).Call(args...)
@@ -53,28 +59,46 @@ func playPadMixed(ctx context.Context, pcm []byte, start int64, channel *mixerCh
 		}
 		return nil
 	}
-	volume := int32(-1)
-	updateVolume := func() error {
-		if channel == nil || channel.volume.Load() == volume {
-			return nil
-		}
-		volume = channel.volume.Load()
-		n := uintptr(volume) * 65535 / 100
-		return invoke("waveOutSetVolume", handle, n|n<<16)
-	}
-	if err := updateVolume(); err != nil {
+	if err := invoke("waveOutSetVolume", handle, 0xffffffff); err != nil {
 		return err
 	}
 	if err := invoke("waveOutPause", handle); err != nil {
 		return err
 	}
-	if err := invoke("waveOutPrepareHeader", handle, uintptr(unsafe.Pointer(&header)), unsafe.Sizeof(header)); err != nil {
-		return err
+	for i := range buffers {
+		b := &buffers[i]
+		b.header = waveHeader{Data: &b.data[0], Length: uint32(len(b.data))}
+		pin.Pin(&b.data[0])
+		pin.Pin(&b.header)
+		if err := invoke("waveOutPrepareHeader", handle, uintptr(unsafe.Pointer(&b.header)), unsafe.Sizeof(b.header)); err != nil {
+			return err
+		}
+		defer winmm.NewProc("waveOutUnprepareHeader").Call(handle, uintptr(unsafe.Pointer(&b.header)), unsafe.Sizeof(b.header))
 	}
-	defer winmm.NewProc("waveOutUnprepareHeader").Call(handle, uintptr(unsafe.Pointer(&header)), unsafe.Sizeof(header))
 	defer winmm.NewProc("waveOutReset").Call(handle)
-	if err := invoke("waveOutWrite", handle, uintptr(unsafe.Pointer(&header)), unsafe.Sizeof(header)); err != nil {
-		return err
+	offset := 0
+	queue := func(i int) error {
+		b := &buffers[i]
+		n := min(len(b.data), len(pcm)-offset)
+		gain := int32(100)
+		if channel != nil {
+			gain = channel.volume.Load()
+		}
+		applyMixerGain(b.data[:n], pcm[offset:offset+n], gain)
+		b.header.Length = uint32(n)
+		if err := invoke("waveOutWrite", handle, uintptr(unsafe.Pointer(&b.header)), unsafe.Sizeof(b.header)); err != nil {
+			return err
+		}
+		offset += n
+		b.queued = true
+		return nil
+	}
+	for i := range buffers {
+		if offset < len(pcm) {
+			if err := queue(i); err != nil {
+				return err
+			}
+		}
 	}
 	timer := time.NewTimer(time.Duration(max(0, start-clockNow())))
 	defer timer.Stop()
@@ -92,16 +116,32 @@ func playPadMixed(ctx context.Context, pcm []byte, start int64, channel *mixerCh
 	defer deadline.Stop()
 	previous := 0
 	started := time.Now()
-	for atomic.LoadUint32(&header.Flags)&1 == 0 {
+	for {
+		pending := false
+		for i := range buffers {
+			b := &buffers[i]
+			if b.queued && atomic.LoadUint32(&b.header.Flags)&1 != 0 { // WHDR_DONE
+				b.queued = false
+			}
+			if !b.queued && offset < len(pcm) {
+				if err := queue(i); err != nil {
+					return err
+				}
+			}
+			pending = pending || b.queued
+		}
+		if !pending {
+			if channel != nil {
+				channel.meter(pcmPeak(pcm[previous*2:]))
+			}
+			return nil
+		}
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-deadline.C:
 			return fmt.Errorf("устройство вывода не завершило воспроизведение")
 		case <-ticker.C:
-			if err := updateVolume(); err != nil {
-				return err
-			}
 			if channel != nil {
 				// MMTIME: request sample position, with a clock fallback for old drivers.
 				position := struct{ Kind, Value, Extra uint32 }{Kind: 2}
@@ -119,5 +159,4 @@ func playPadMixed(ctx context.Context, pcm []byte, start int64, channel *mixerCh
 			}
 		}
 	}
-	return nil
 }

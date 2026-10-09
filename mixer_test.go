@@ -1,9 +1,54 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"testing"
 )
+
+func TestMixerGain(t *testing.T) {
+	for _, test := range []struct{ position, gain int32 }{
+		{-1, 200}, {0, 200}, {mixerUnityPosition, 100}, {100, 0}, {101, 0},
+	} {
+		if got := mixerGain(test.position); got != test.gain {
+			t.Fatalf("position %d: gain %d, want %d", test.position, got, test.gain)
+		}
+	}
+	for position := int32(0); position <= 100; position++ {
+		gain := mixerGain(position)
+		if mixerPosition(gain) != position || gain > mixerGain(position-1) {
+			t.Fatal("gain mapping jumps or reverses", position, gain)
+		}
+	}
+	values := []int16{-32768, -20000, -1000, 0, 1000, 20000, 32767}
+	src, dst := make([]byte, len(values)*2), make([]byte, len(values)*2)
+	for i, value := range values {
+		binary.LittleEndian.PutUint16(src[2*i:], uint16(value))
+	}
+	original := bytes.Clone(src)
+	for _, test := range []struct {
+		gain int32
+		want []int16
+	}{
+		{0, []int16{0, 0, 0, 0, 0, 0, 0}},
+		{25, []int16{-8192, -5000, -250, 0, 250, 5000, 8191}},
+		{100, values},
+		{150, []int16{-32768, -30000, -1500, 0, 1500, 30000, 32767}},
+		{200, []int16{-32768, -32768, -2000, 0, 2000, 32767, 32767}},
+		{100, values},
+	} {
+		applyMixerGain(dst, src, test.gain)
+		for i, want := range test.want {
+			if got := int16(binary.LittleEndian.Uint16(dst[2*i:])); got != want {
+				t.Fatalf("gain %d, sample %d: got %d, want %d", test.gain, values[i], got, want)
+			}
+		}
+		if !bytes.Equal(src, original) {
+			t.Fatal("monitor gain changed source audio")
+		}
+	}
+}
 
 func TestMixerRosterAndMeter(t *testing.T) {
 	v := &voiceSession{source: 2, ctx: context.Background()}

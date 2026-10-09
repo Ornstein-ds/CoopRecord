@@ -15,6 +15,7 @@ import (
 )
 
 type trackInfo struct {
+	Desktop      bool `json:",omitempty"`
 	ID           string
 	Name         string
 	CorrectionMS int
@@ -364,16 +365,16 @@ func renderTrack(dir string, t trackInfo, m manifest, total int64) (warnings []s
 		if e == io.ErrUnexpectedEOF {
 			warnings = append(warnings, t.Name+": неполный последний блок отброшен")
 		}
-		if count == 0 || firstAudio < 0 {
+		if !t.Desktop && (count == 0 || firstAudio < 0) {
 			warnings = append(warnings, t.Name+": аудио не получено, дорожка содержит тишину")
 		}
-		if firstAudio > sampleRate/10 {
+		if !t.Desktop && firstAudio > sampleRate/10 {
 			warnings = append(warnings, t.Name+": в начале дорожки есть участок тишины более 100 мс")
 		}
-		if total-lastAudio > sampleRate/10 {
+		if !t.Desktop && total-lastAudio > sampleRate/10 {
 			warnings = append(warnings, t.Name+": в конце дорожки не хватает более 100 мс аудио")
 		}
-		if len(spans) > 1 {
+		if !t.Desktop && len(spans) > 1 {
 			warnings = append(warnings, fmt.Sprintf("%s: разрывы временных меток: %d", t.Name, len(spans)-1))
 		}
 		return writeSilence(w, total-cursor)
@@ -397,7 +398,11 @@ func renderMix(dir string, m manifest, total int64) error {
 	}
 	readers := make([]*bufio.Reader, 0, len(m.Tracks))
 	buffers := make([][]byte, 0, len(m.Tracks))
+	microphones := int32(0)
 	for _, t := range m.Tracks {
+		if !t.Desktop {
+			microphones++
+		}
 		f, err := os.Open(filepath.Join(dir, t.ID+".wav"))
 		if err != nil {
 			return err
@@ -424,11 +429,16 @@ func renderMix(dir string, m manifest, total int64) error {
 				}
 			}
 			for j := 0; j < n; j += 2 {
-				sum := int32(0)
-				for _, b := range buffers {
-					sum += int32(int16(binary.LittleEndian.Uint16(b[j:])))
+				sum, desktop := int32(0), int32(0)
+				for i, b := range buffers {
+					value := int32(int16(binary.LittleEndian.Uint16(b[j:])))
+					if m.Tracks[i].Desktop {
+						desktop += value
+					} else {
+						sum += value
+					}
 				}
-				mixed := sum / int32(len(readers))
+				mixed := sum/max(1, microphones) + desktop
 				if pads != nil {
 					mixed += int32(int16(binary.LittleEndian.Uint16(padBuffer[j:])))
 				}
@@ -453,15 +463,25 @@ func exportSession(dir string) (manifest, error) {
 	if err = json.Unmarshal(b, &m); err != nil {
 		return m, err
 	}
-	if (m.Version < 1 || m.Version > 4) || m.Start <= 0 || len(m.Tracks) == 0 || len(m.Tracks) > maxPeers+1 {
+	if (m.Version < 1 || m.Version > 5) || m.Start <= 0 || len(m.Tracks) == 0 || len(m.Tracks) > 2*(maxPeers+1) {
 		return m, fmt.Errorf("неподдерживаемая сессия")
 	}
 	ids := map[string]bool{}
+	counts := [2]int{}
 	for _, t := range m.Tracks {
-		if !strings.HasPrefix(t.ID, "track-") || len(t.ID) != 8 || t.ID[6] < '0' || t.ID[6] > '9' || t.ID[7] < '0' || t.ID[7] > '9' || ids[t.ID] || t.CorrectionMS < -2000 || t.CorrectionMS > 2000 {
+		prefix, kind := "track-", 0
+		if t.Desktop {
+			prefix, kind = "desktop-", 1
+		}
+		counts[kind]++
+		number := strings.TrimPrefix(t.ID, prefix)
+		if !strings.HasPrefix(t.ID, prefix) || len(number) != 2 || number[0] < '0' || number[0] > '9' || number[1] < '0' || number[1] > '9' || counts[kind] > maxPeers+1 || (t.Desktop && m.Version < 5) || ids[t.ID] || t.CorrectionMS < -2000 || t.CorrectionMS > 2000 {
 			return m, fmt.Errorf("неверный идентификатор дорожки")
 		}
 		ids[t.ID] = true
+	}
+	if counts[0] == 0 {
+		return m, fmt.Errorf("нет микрофонных дорожек")
 	}
 	if m.End == 0 {
 		for _, t := range m.Tracks {

@@ -15,6 +15,7 @@ const voiceFrames = sampleRate / 100 // 10 ms; the whole UDP datagram fits below
 const voiceHeader = 48
 const voicePacketSize = voiceHeader + voiceFrames*2
 const voiceSlots = 32
+const desktopSource uint32 = 1 << 31
 
 type voicePeer struct {
 	token [32]byte
@@ -123,22 +124,26 @@ func (v *voiceSession) enqueue(p packet) {
 }
 
 func (v *voiceSession) sendMicrophone() {
-	var pending []byte
-	seq := uint64(0)
+	var pending [2][]byte
+	var seq [2]uint64
 	for {
 		select {
 		case <-v.ctx.Done():
 			return
 		case p := <-v.mic:
-			if p.Discontinuity {
-				pending = nil
-				seq++
+			kind, source := 0, v.source
+			if p.Desktop {
+				kind, source = 1, source|desktopSource
 			}
-			pending = append(pending, p.PCM...)
-			for len(pending) >= voiceFrames*2 {
-				seq++
-				v.send(v.source, seq, pending[:voiceFrames*2])
-				pending = pending[voiceFrames*2:]
+			if p.Discontinuity {
+				pending[kind] = nil
+				seq[kind]++
+			}
+			pending[kind] = append(pending[kind], p.PCM...)
+			for len(pending[kind]) >= voiceFrames*2 {
+				seq[kind]++
+				v.send(source, seq[kind], pending[kind][:voiceFrames*2])
+				pending[kind] = pending[kind][voiceFrames*2:]
 			}
 		}
 	}
@@ -146,7 +151,7 @@ func (v *voiceSession) sendMicrophone() {
 
 func (v *voiceSession) send(source uint32, seq uint64, pcm []byte) {
 	b := make([]byte, voicePacketSize)
-	copy(b, "CRV5")
+	copy(b, "CRV7")
 	binary.LittleEndian.PutUint32(b[4:], source)
 	binary.LittleEndian.PutUint64(b[8:], seq)
 	copy(b[voiceHeader:], pcm)
@@ -160,7 +165,7 @@ func (v *voiceSession) send(source uint32, seq uint64, pcm []byte) {
 	v.mu.Lock()
 	var targets []voicePeer
 	for id, p := range v.peers {
-		if id != source && p.addr != nil {
+		if id != source&^desktopSource && p.addr != nil {
 			targets = append(targets, *p)
 		}
 	}
@@ -183,18 +188,18 @@ func (v *voiceSession) receive() {
 			v.setError(err)
 			return
 		}
-		if n != voicePacketSize || string(b[:4]) != "CRV5" {
+		if n != voicePacketSize || string(b[:4]) != "CRV7" {
 			continue
 		}
 		source, seq := binary.LittleEndian.Uint32(b[4:]), binary.LittleEndian.Uint64(b[8:])
-		if source == v.source || seq == 0 || seq >= 1<<40 {
+		if source&^desktopSource == v.source || seq == 0 || seq >= 1<<40 {
 			continue
 		}
 		now := time.Now()
 		v.mu.Lock()
 		valid := false
 		if v.server == nil {
-			p := v.peers[source]
+			p := v.peers[source&^desktopSource]
 			if p != nil && p.ip.Equal(addr.IP) && subtle.ConstantTimeCompare(b[16:48], p.token[:]) == 1 {
 				p.addr, p.last = addr, now
 				valid = true
@@ -221,7 +226,7 @@ func (v *voiceSession) pushLocked(source uint32, seq uint64, pcm []byte, now tim
 				delete(v.streams, id)
 			}
 		}
-		if len(v.streams) >= maxPeers {
+		if len(v.streams) >= 2*maxPeers {
 			return false
 		}
 		s = &voiceStream{}
@@ -259,7 +264,7 @@ func (v *voiceSession) fill(out []byte) {
 	now := time.Now()
 	sums := make([]float64, len(out)/2)
 	for id, s := range v.streams {
-		channel := v.channels[id]
+		channel := v.channels[id&^desktopSource]
 		gain := 1.0
 		if channel != nil {
 			gain = float64(channel.volume.Load()) / 100

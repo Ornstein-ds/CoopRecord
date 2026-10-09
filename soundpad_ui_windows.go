@@ -53,8 +53,8 @@ func (u *windowUI) chooseSound() string {
 
 func (u *windowUI) createSoundpad(c settings) {
 	u.padFiles = c.PadFiles
-	u.label("Саундпад · 9 звуков для всей сессии", 746, 22, 660)
-	u.label("Хост выбирает WAV/MP3 до создания сессии. Клавиши — на каждом ПК.", 746, 49, 675)
+	u.label("Саундпад · 9 звуков для всей сессии", 746, 22, 405)
+	u.label("WAV / MP3 · горячие клавиши на каждом ПК", 746, 49, 405)
 	for i := 0; i < padCount; i++ {
 		x, y := 746+(i%3)*170, 82+(i/3)*125
 		u.control(idPadFirst+i, "BUTTON", fmt.Sprintf("%d\r\nПусто", i+1), 0x10000|0x2000, x, y, 96, 96)
@@ -206,7 +206,7 @@ func (u *windowUI) updateSoundpad(v viewState) {
 		enable(u.controls[idPadLoadFirst+i], edit)
 		enable(u.controls[idPadClearFirst+i], edit)
 	}
-	sendMessage.Call(u.controls[idPadProgress], 0x402, uintptr(v.PadProgress), 0)
+	setProgress(u.controls[idPadProgress], v.PadProgress)
 	if v.PadStatus != u.lastPadStatus {
 		setText(u.controls[idPadStatus], v.PadStatus)
 		u.lastPadStatus = v.PadStatus

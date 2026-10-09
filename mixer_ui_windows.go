@@ -5,21 +5,36 @@ package main
 import "fmt"
 
 const idMixerFirst = 400
+const idDesktopMute = 450
 
 func (u *windowUI) createMixer() {
-	u.control(0, "BUTTON", "5. Микшер — громкость в ваших наушниках", 7, 20, 700, 1400, 319)
-	u.label("На WAV-записи не влияет. Индикаторы показывают входной уровень дорожек, до фейдера. 100% — исходная громкость, 0% — без звука.", 34, 724, 1365)
+	u.control(0, "BUTTON", "5. Микшер — прослушивание и передача звука компьютера", 7, 20, 700, 1400, 319)
+	u.label("Жирная отметка — 100%, максимум — 200%. Только «Звук компьютера» меняет передачу и запись; остальные фейдеры — ваши наушники.", 34, 724, 1365)
 	for i := range u.mixerChannels {
-		x, id := 34+i*173, idMixerFirst+i*4
-		u.control(id, "STATIC", "Нет участника", 0x1|0x4000, x, 753, 160, 38) // centered, no mnemonic processing
-		u.control(id+1, "msctls_trackbar32", "Громкость", 0x10000|0x2|0x10, x+38, 795, 44, 180)
+		x, id := 34+i*153, idMixerFirst+i*4
+		u.control(id, "STATIC", "Нет участника", 0x1|0x4000, x, 753, 140, 38) // centered, no mnemonic processing
+		u.control(id+1, "msctls_trackbar32", "Громкость", 0x10000|0x2|0x4, x+38, 795, 44, 160)
 		sendMessage.Call(u.controls[id+1], 0x406, 1, 100<<16) // range 0..100, top = loud
-		u.control(id+2, "msctls_progress32", "Уровень сигнала", 0x4|0x1, x+88, 795, 22, 180)
-		u.control(id+3, "STATIC", "", 1, x, 985, 160, 22)
+		for _, position := range []uintptr{10, 20, 30, mixerUnityPosition, 40, 50, 60, 70, 80, 90} {
+			sendMessage.Call(u.controls[id+1], 0x404, 0, position) // TBM_SETTIC
+		}
+		sendMessage.Call(u.controls[id+1], 0x405, 1, mixerUnityPosition)
+		u.control(id+2, "msctls_progress32", "Уровень сигнала", 0x4|0x1, x+88, 795, 22, 160)
+		u.control(id+3, "STATIC", "", 1, x, 958, 140, 22)
 	}
+	u.control(idDesktopMute, "BUTTON", "Мьют включён", 0x10000, 34+153+5, 984, 130, 24)
 }
 
 func (u *windowUI) updateMixer() {
+	caption := "Мьют включён"
+	if !u.e.desktopMuted.Load() {
+		caption = "Звук передаётся"
+	}
+	setText(u.controls[idDesktopMute], caption)
+	u.e.mu.Lock()
+	connected := u.e.voice != nil && u.e.inputReady && u.e.ctx != nil && u.e.ctx.Err() == nil
+	u.e.mu.Unlock()
+	enable(u.controls[idDesktopMute], connected && !u.busy)
 	strips := u.e.mixerStrips()
 	// Keep surviving channels in their slots, even when somebody leaves during a drag.
 	for i, c := range u.mixerChannels {
@@ -63,7 +78,10 @@ func (u *windowUI) updateMixer() {
 			volume := c.volume.Load()
 			percent = fmt.Sprintf("%d%%", volume)
 			level = c.peak.Swap(0)
-			sendMessage.Call(u.controls[id+1], 0x405, 1, uintptr(100-volume))
+			position, _, _ := sendMessage.Call(u.controls[id+1], 0x400, 0, 0)
+			if position != uintptr(mixerPosition(volume)) {
+				sendMessage.Call(u.controls[id+1], 0x405, 1, uintptr(mixerPosition(volume)))
+			}
 		}
 		enable(u.controls[id+1], c != nil)
 		if getText(u.controls[id]) != name {
@@ -72,7 +90,7 @@ func (u *windowUI) updateMixer() {
 		if getText(u.controls[id+3]) != percent {
 			setText(u.controls[id+3], percent)
 		}
-		sendMessage.Call(u.controls[id+2], 0x402, uintptr(level), 0)
+		setProgress(u.controls[id+2], int(level))
 	}
 }
 
@@ -81,7 +99,7 @@ func (u *windowUI) mixerScroll(hwnd uintptr) {
 		id := idMixerFirst + i*4
 		if c != nil && hwnd != 0 && hwnd == u.controls[id+1] {
 			position, _, _ := sendMessage.Call(hwnd, 0x400, 0, 0)
-			volume := int32(100 - min(position, 100))
+			volume := mixerGain(int32(position))
 			c.volume.Store(volume)
 			setText(u.controls[id+3], fmt.Sprintf("%d%%", volume))
 			return

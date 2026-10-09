@@ -78,9 +78,9 @@ func TestVoiceSessionAllParticipants(t *testing.T) {
 	}
 	checkHeard([3]int32{6000, 5000, 3000}) // Each recipient hears everyone except themselves.
 	waitFor(t, func() bool {
-		return len(host.mixerStrips()) == 3 && len(engines[1].mixerStrips()) == 3 && len(engines[2].mixerStrips()) == 3
+		return len(host.mixerStrips()) == 4 && len(engines[1].mixerStrips()) == 4 && len(engines[2].mixerStrips()) == 4
 	})
-	strips := engines[1].mixerStrips()
+	strips := engines[1].mixerStrips()[1:]
 	if strips[1].Name != "Host" || strips[2].Name != "Guest" {
 		t.Fatal("wrong mixer names", strips)
 	}
@@ -90,6 +90,8 @@ func TestVoiceSessionAllParticipants(t *testing.T) {
 	if strips[1].Channel.peak.Load() != 3 || strips[2].Channel.peak.Load() != 12 {
 		t.Fatal("input meters must remain active at half volume and mute")
 	}
+	strips[1].Channel.volume.Store(200)
+	checkHeard([3]int32{6000, 2000, 3000})
 	entries, err := os.ReadDir(folder)
 	if err != nil || len(entries) != 0 {
 		t.Fatal("conversation created recording files", err)
@@ -117,7 +119,7 @@ func TestVoiceSessionAllParticipants(t *testing.T) {
 		}
 	}
 	host.mu.Unlock()
-	checkHeard([3]int32{6000, 500, 3000})
+	checkHeard([3]int32{6000, 2000, 3000})
 	time.Sleep(150 * time.Millisecond)
 	if err := host.stopRecording(); err != nil {
 		t.Fatal(err)
@@ -142,8 +144,8 @@ func TestVoiceSessionAllParticipants(t *testing.T) {
 	old := engines[2].voice
 	engines[2].disconnect()
 	waitFor(t, func() bool { return heard[0].Load() == 2000 && heard[1].Load() == 1000 })
-	waitFor(t, func() bool { return len(host.mixerStrips()) == 2 && len(engines[1].mixerStrips()) == 2 })
-	if engines[1].mixerStrips()[1].Channel != strips[1].Channel {
+	waitFor(t, func() bool { return len(host.mixerStrips()) == 3 && len(engines[1].mixerStrips()) == 3 })
+	if engines[1].mixerStrips()[2].Channel != strips[1].Channel {
 		t.Fatal("surviving channel lost its controls")
 	}
 	if old.ctx.Err() == nil {
@@ -153,13 +155,13 @@ func TestVoiceSessionAllParticipants(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkHeard([3]int32{6000, 5000, 3000})
-	waitFor(t, func() bool { return len(engines[1].mixerStrips()) == 3 })
-	if engines[1].mixerStrips()[2].Channel == strips[2].Channel {
+	waitFor(t, func() bool { return len(engines[1].mixerStrips()) == 4 })
+	if engines[1].mixerStrips()[3].Channel == strips[2].Channel {
 		t.Fatal("reconnected guest retained old channel")
 	}
 	v := engines[2].voice
 	bad := make([]byte, voicePacketSize)
-	copy(bad, "CRV5")
+	copy(bad, "CRV7")
 	binary.LittleEndian.PutUint32(bad[4:], v.source)
 	binary.LittleEndian.PutUint64(bad[8:], 1e9)
 	copy(bad[16:], old.token[:]) // Old session token must not authorize a reconnected peer.

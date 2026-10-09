@@ -22,15 +22,28 @@ func TestMixerControls(t *testing.T) {
 	u := &windowUI{hwnd: parent, controls: map[int]uintptr{}, scale: 1, e: newTestEngine(syntheticCapture)}
 	u.createMixer()
 	u.updateMixer()
+	if getText(u.controls[idMixerFirst+4]) != "Звук компьютера" || getText(u.controls[idDesktopMute]) != "Мьют включён" || !u.e.desktopMuted.Load() {
+		t.Fatal("desktop mute control is not the second strip or not on by default")
+	}
 	h := u.controls[idMixerFirst+1]
 	if h == 0 {
 		t.Fatal("no native fader")
 	}
-	for _, position := range []uintptr{0, 25, 100} {
+	for i := range u.mixerChannels {
+		position, _, _ := sendMessage.Call(u.controls[idMixerFirst+i*4+1], 0x400, 0, 0)
+		if position != mixerUnityPosition {
+			t.Fatal("initial fader position", i, position)
+		}
+	}
+	for _, position := range []uintptr{0, 25, mixerUnityPosition, 60, 100} {
 		sendMessage.Call(h, 0x405, 1, position)
 		u.mixerScroll(h)
-		if got := u.e.padMixer.volume.Load(); got != int32(100-position) {
+		if got := u.e.padMixer.volume.Load(); got != mixerGain(int32(position)) {
 			t.Fatal("fader direction/gain", got)
+		}
+		u.updateMixer()
+		if got, _, _ := sendMessage.Call(h, 0x400, 0, 0); got != position {
+			t.Fatal("fader jumps after update", position, got)
 		}
 	}
 	u.e.padMixer.meter(75)

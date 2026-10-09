@@ -49,6 +49,8 @@ const (
 	idRecover
 	idUpdate
 	idVoiceStatus
+	idTheme
+	idSystemTheme
 )
 
 type winClass struct {
@@ -77,7 +79,8 @@ type uiResult struct {
 	downloadPath string
 }
 type windowUI struct {
-	mixerChannels          [maxPeers + 1]*mixerChannel
+	theme                  uiTheme
+	mixerChannels          [maxPeers + 2]*mixerChannel
 	padFiles               [padCount]string
 	padLabels              [padCount]string
 	lastPadStatus          string
@@ -104,7 +107,11 @@ func call(proc string, args ...uintptr) uintptr {
 func messageBox(hwnd uintptr, text string, flags uintptr) uintptr {
 	return call("MessageBoxW", hwnd, uintptr(unsafe.Pointer(wide(text))), uintptr(unsafe.Pointer(wide("CoopRecord"))), flags)
 }
-func setText(hwnd uintptr, s string) { call("SetWindowTextW", hwnd, uintptr(unsafe.Pointer(wide(s)))) }
+func setText(hwnd uintptr, s string) {
+	if hwnd != 0 && getText(hwnd) != s {
+		call("SetWindowTextW", hwnd, uintptr(unsafe.Pointer(wide(s))))
+	}
+}
 func getText(hwnd uintptr) string {
 	n := call("GetWindowTextLengthW", hwnd)
 	b := make([]uint16, n+1)
@@ -112,23 +119,70 @@ func getText(hwnd uintptr) string {
 	return syscall.UTF16ToString(b)
 }
 func enable(hwnd uintptr, on bool) {
+	if hwnd == 0 || (call("IsWindowEnabled", hwnd) != 0) == on {
+		return
+	}
 	n := uintptr(0)
 	if on {
 		n = 1
 	}
 	call("EnableWindow", hwnd, n)
 }
+
+func setProgress(hwnd uintptr, value int) {
+	if hwnd == 0 {
+		return
+	}
+	position, _, _ := sendMessage.Call(hwnd, 0x408, 0, 0)
+	if position != uintptr(value) {
+		sendMessage.Call(hwnd, 0x402, uintptr(value), 0)
+	}
+}
 func selected(hwnd uintptr) int      { n, _, _ := sendMessage.Call(hwnd, 0x147, 0, 0); return int(int32(n)) }
 func (u *windowUI) px(n int) uintptr { return uintptr(int(float64(n) * u.scale)) }
 func (u *windowUI) control(id int, class, text string, style uint32, x, y, w, h int) uintptr {
+	if u.theme.enabled {
+		y += 32
+	}
+	if u.theme.enabled && class == "BUTTON" {
+		if style&15 == 7 {
+			u.theme.cards = append(u.theme.cards, rect{int32(u.px(x)), int32(u.px(y + 9)), int32(u.px(x + w)), int32(u.px(y + h))})
+			return u.control(id, "STATIC", text, 0, x+14, y-30, w-28, 20)
+		}
+		style = style&^15 | 11 // BS_OWNERDRAW; Windows still handles input and focus.
+	}
 	ex := uintptr(0)
-	if class == "EDIT" {
+	if class == "EDIT" && !u.theme.enabled {
 		ex = 0x200
+	}
+	var field rect
+	if u.theme.enabled && (class == "EDIT" || class == "COMBOBOX" || class == "msctls_hotkey32") {
+		fh := h
+		if class == "COMBOBOX" {
+			fh = 24
+		}
+		field = rect{int32(u.px(x)), int32(u.px(y)), int32(u.px(x + w)), int32(u.px(y + fh))}
+		x += 6
+		y += 3
+		w -= 12
+		if class != "COMBOBOX" {
+			h -= 6
+		}
+		style &^= 0x800000
 	}
 	child := call("CreateWindowExW", ex, uintptr(unsafe.Pointer(wide(class))), uintptr(unsafe.Pointer(wide(text))), uintptr(style|0x50000000), u.px(x), u.px(y), u.px(w), u.px(h), u.hwnd, uintptr(id), 0, 0)
 	sendMessage.Call(child, 0x30, u.font, 1)
 	if id != 0 {
 		u.controls[id] = child
+	}
+	if u.theme.enabled {
+		u.themeControl(child, class)
+		if field.Right != 0 {
+			u.theme.fields[child] = field
+			if class == "COMBOBOX" {
+				u.fitCombo(child)
+			}
+		}
 	}
 	return child
 }
@@ -227,6 +281,7 @@ func (u *windowUI) settings() (settings, error) {
 	c.PadFiles = u.padFiles
 	c.PadKeys = u.readPadKeys()
 	c.PadKeysSet = true
+	c.Theme = u.theme.preference
 	i := selected(u.controls[idMic])
 	if i >= 0 && i < len(u.devices) {
 		c.DeviceID = u.devices[i].ID
@@ -324,6 +379,22 @@ func (u *windowUI) chooseFolder(title string) string {
 	return syscall.UTF16ToString(path[:])
 }
 func (u *windowUI) command(id int, notification int) {
+	if notification == 0 && (id == idTheme || id == idSystemTheme) {
+		preference := ""
+		if id == idTheme {
+			preference = "dark"
+			if u.theme.dark {
+				preference = "light"
+			}
+		}
+		if err := saveThemePreference(preference); err != nil {
+			messageBox(u.hwnd, "Не удалось сохранить тему: "+err.Error(), 0x10)
+			return
+		}
+		u.theme.preference = preference
+		u.applyTheme()
+		return
+	}
 	if id == idRole && notification == 1 {
 		role := selected(u.controls[idRole])
 		if u.busy || role < 0 || role > 1 || role == u.role {
@@ -344,6 +415,9 @@ func (u *windowUI) command(id int, notification int) {
 		return
 	}
 	switch id {
+	case idDesktopMute:
+		muted := !u.e.desktopMuted.Load()
+		u.async(func() error { return u.e.setDesktopMuted(muted) }, false)
 	case idUpdate:
 		if u.e.snapshot().Mode != "" {
 			return
@@ -482,7 +556,7 @@ drained:
 		connect = "Отключиться"
 	}
 	setText(u.controls[idConnect], connect)
-	sendMessage.Call(u.controls[idLevel], 0x402, uintptr(v.Level), 0)
+	setProgress(u.controls[idLevel], v.Level)
 	status := v.Status
 	if v.Recording && v.Mode == "host" && !v.Exporting && !u.busy {
 		status = "● Идёт запись. Остановите её для создания WAV-файлов."
@@ -508,6 +582,19 @@ drained:
 
 func windowProc(hwnd uintptr, msg uint32, w, l uintptr) uintptr {
 	u := appUI
+	if u != nil && u.theme.enabled {
+		if msg == 0x2b {
+			// WM_DRAWITEM supplies a native pointer valid only for this callback.
+			d := *(**drawItem)(unsafe.Pointer(&l))
+			if d.Type == 4 {
+				u.drawButton(d)
+				return 1
+			}
+		}
+		if result, handled := u.themeMessage(hwnd, msg, w, l); handled {
+			return result
+		}
+	}
 	switch msg {
 	case 0x115: // WM_VSCROLL: native vertical trackbars, including keyboard changes.
 		if u != nil {
@@ -564,6 +651,10 @@ func main() {
 	}
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	releaseStyle := activateVisualStyles()
+	defer releaseStyle()
+	themes.NewProc("BufferedPaintInit").Call()
+	defer themes.NewProc("BufferedPaintUnInit").Call()
 	_ = ole.CoInitializeEx(0, ole.COINIT_APARTMENTTHREADED)
 	defer ole.CoUninitialize()
 	call("SetProcessDPIAware")
@@ -577,6 +668,9 @@ func main() {
 	fit := min(float64(dpi)/96, min(float64(call("GetSystemMetrics", 0)-40)/1440, float64(call("GetSystemMetrics", 1)-80)/1035))
 	dpi = uintptr(fit * 96)
 	u := &windowUI{controls: make(map[int]uintptr), e: newEngine(captureAudio), results: make(chan uiResult, 16), scale: float64(dpi) / 96}
+	c := loadSettings()
+	u.theme = uiTheme{enabled: true, preference: c.Theme, children: make(map[uintptr]string), fields: make(map[uintptr]rect)}
+	defer u.theme.close()
 	appUI = u
 	fontHeight := int32(-13 * int(dpi) / 96)
 	u.font, _, _ = gdi32.NewProc("CreateFontW").Call(uintptr(fontHeight), 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0, uintptr(unsafe.Pointer(wide("Segoe UI"))))
@@ -592,7 +686,7 @@ func main() {
 		messageBox(0, "Не удалось зарегистрировать окно.", 0x10)
 		return
 	}
-	style := uint32(0x00c80000 | 0x00020000)
+	style := uint32(0x00c80000 | 0x00020000 | 0x02000000) // clip children while painting the background
 	r := rect{Right: int32(u.px(1440)), Bottom: int32(u.px(1035))}
 	call("AdjustWindowRectEx", uintptr(unsafe.Pointer(&r)), uintptr(style), 0, 0x10000)
 	u.hwnd = call("CreateWindowExW", 0x10000, uintptr(unsafe.Pointer(class)), uintptr(unsafe.Pointer(wide("CoopRecord v"+appVersion+" — запись подкаста"))), uintptr(style), 0x80000000, 0x80000000, uintptr(r.Right-r.Left), uintptr(r.Bottom-r.Top), 0, 0, instance, 0)
@@ -600,6 +694,7 @@ func main() {
 		messageBox(0, "Не удалось создать окно.", 0x10)
 		return
 	}
+	call("SetWindowPos", u.hwnd, 0, 0, 0, 0, 0, 0x27)
 	syscall.NewLazyDLL("comctl32.dll").NewProc("InitCommonControls").Call()
 	title := u.control(0, "STATIC", "CoopRecord", 0, 22, 12, 350, 34)
 	sendMessage.Call(title, 0x30, u.titleFont, 1)
@@ -607,8 +702,9 @@ func main() {
 	u.button(idUpdate, "Обновить приложение", 505, 15, 195)
 	u.label("Совместная запись подкаста  ·  WAV 48 кГц / 16 бит  ·  Windows x64", 24, 47, 680)
 	u.control(0, "BUTTON", "1. Ваш звук", 7, 20, 78, 680, 143)
-	c := loadSettings()
 	u.createSoundpad(c)
+	u.button(idTheme, "Тёмная тема", 1164, 15, 248)
+	u.button(idSystemTheme, "Как в Windows", 1164, 47, 248)
 	u.createMixer()
 	u.role = c.Role
 	u.connections[0].address, u.connections[0].key = "0.0.0.0:"+defaultPort, sessionKey()
@@ -650,6 +746,7 @@ func main() {
 	u.button(idRecover, "Восстановить WAV…", 20, 656, 195)
 	u.label("Голос включён в сессии. Используйте наушники.", 230, 662, 476)
 	u.control(idVoiceStatus, "EDIT", "", 0x200844, 746, 480, 666, 60)
+	u.applyTheme()
 	u.refreshDevices(c.DeviceID)
 	if err := u.applyPadKeys(); err != nil {
 		u.e.lastError = err.Error()

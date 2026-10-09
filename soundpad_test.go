@@ -448,13 +448,17 @@ func TestSoundpadPlaybackSmoke(t *testing.T) {
 	changed := make(chan struct{})
 	go func() {
 		defer close(changed)
-		for _, volume := range []int32{0, 25, 100} {
+		for _, volume := range []int32{0, 25, 100, 200, 100} {
 			time.Sleep(40 * time.Millisecond)
 			channel.volume.Store(volume)
 		}
 	}()
+	playStart := time.Now()
 	if err := playPadMixed(ctx, make([]byte, sampleRate/2), clockNow()+20e6, channel); err != nil {
 		t.Fatal(err)
+	}
+	if ctx.Err() != nil || time.Since(playStart) < 200*time.Millisecond {
+		t.Fatal("playback did not drain the whole clip")
 	}
 	<-changed
 	// Cancel an output buffer that is already playing, not only a queued start.

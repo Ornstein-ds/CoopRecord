@@ -97,6 +97,14 @@ func inputDevices() ([]inputDevice, error) {
 
 // All COM calls stay on one OS thread. The callback must not block the audio driver.
 func captureAudio(ctx context.Context, deviceID string, ready chan<- error, emit func(packet) error, level *atomic.Int32) (result error) {
+	return captureWASAPI(ctx, deviceID, false, ready, emit, level)
+}
+
+func captureDesktop(ctx context.Context, _ string, ready chan<- error, emit func(packet) error, level *atomic.Int32) error {
+	return captureWASAPI(ctx, "", true, ready, emit, level)
+}
+
+func captureWASAPI(ctx context.Context, deviceID string, desktop bool, ready chan<- error, emit func(packet) error, level *atomic.Int32) (result error) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	announced := false
@@ -106,36 +114,57 @@ func captureAudio(ctx context.Context, deviceID string, ready chan<- error, emit
 		}
 		level.Store(0)
 	}()
-	if result = initAudioCOM(); result != nil {
+	label := "микрофон"
+	if desktop {
+		label = "звук компьютера"
+		result = ole.CoInitializeEx(0, ole.COINIT_MULTITHREADED)
+		if err, ok := result.(*ole.OleError); ok && err.Code() == 1 {
+			result = nil
+		}
+	} else {
+		result = initAudioCOM()
+	}
+	if result != nil {
 		return
 	}
 	defer ole.CoUninitialize()
-	e, err := audioEnumerator()
-	if err != nil {
-		return err
-	}
-	defer e.Release()
-	var device *wca.IMMDevice
-	id, err := syscall.UTF16PtrFromString(deviceID)
-	if err != nil {
-		return err
-	}
-	// go-wca v0.3.0 leaves GetDevice unimplemented and passes Activate's context incorrectly.
-	hr, _, _ := syscall.SyscallN(e.VTable().GetDevice, uintptr(unsafe.Pointer(e)), uintptr(unsafe.Pointer(id)), uintptr(unsafe.Pointer(&device)))
-	if int32(hr) < 0 {
-		return fmt.Errorf("микрофон недоступен: 0x%08x", uint32(hr))
-	}
-	defer device.Release()
 	var client *wca.IAudioClient
-	hr, _, _ = syscall.SyscallN(device.VTable().Activate, uintptr(unsafe.Pointer(device)), uintptr(unsafe.Pointer(wca.IID_IAudioClient)), uintptr(wca.CLSCTX_ALL), 0, uintptr(unsafe.Pointer(&client)))
-	if int32(hr) < 0 {
-		return fmt.Errorf("WASAPI Activate: 0x%08x", uint32(hr))
+	var err error
+	if desktop {
+		client, err = activateDesktopClient(ctx)
+		if err != nil {
+			return err
+		}
+	} else {
+		e, err := audioEnumerator()
+		if err != nil {
+			return err
+		}
+		defer e.Release()
+		var device *wca.IMMDevice
+		id, err := syscall.UTF16PtrFromString(deviceID)
+		if err != nil {
+			return err
+		}
+		// go-wca v0.3.0 leaves GetDevice unimplemented and passes Activate's context incorrectly.
+		hr, _, _ := syscall.SyscallN(e.VTable().GetDevice, uintptr(unsafe.Pointer(e)), uintptr(unsafe.Pointer(id)), uintptr(unsafe.Pointer(&device)))
+		if int32(hr) < 0 {
+			return fmt.Errorf("микрофон недоступен: 0x%08x", uint32(hr))
+		}
+		defer device.Release()
+		hr, _, _ = syscall.SyscallN(device.VTable().Activate, uintptr(unsafe.Pointer(device)), uintptr(unsafe.Pointer(wca.IID_IAudioClient)), uintptr(wca.CLSCTX_ALL), 0, uintptr(unsafe.Pointer(&client)))
+		if int32(hr) < 0 {
+			return fmt.Errorf("WASAPI Activate: 0x%08x", uint32(hr))
+		}
 	}
 	defer client.Release()
 	format := wca.WAVEFORMATEX{WFormatTag: 1, NChannels: 1, NSamplesPerSec: sampleRate, NAvgBytesPerSec: sampleRate * 2, NBlockAlign: 2, WBitsPerSample: 16}
 	flags := uint32(wca.AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | wca.AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY)
+	if desktop {
+		flags |= wca.AUDCLNT_STREAMFLAGS_LOOPBACK
+	}
 	if err = client.Initialize(wca.AUDCLNT_SHAREMODE_SHARED, flags, 1000000, 0, &format, nil); err != nil {
-		return fmt.Errorf("микрофон: %w (проверьте разрешение Windows на доступ к микрофону)", err)
+		return fmt.Errorf("%s: %w", label, err)
 	}
 	var capture *wca.IAudioCaptureClient
 	if err = client.GetService(wca.IID_IAudioCaptureClient, &capture); err != nil {
@@ -183,7 +212,7 @@ func captureAudio(ctx context.Context, deviceID string, ready chan<- error, emit
 				return err
 			}
 			if status&4 != 0 {
-				return fmt.Errorf("микрофон вернул недостоверную временную метку; запись остановлена")
+				return fmt.Errorf("%s: недостоверная временная метка", label)
 			}
 			discontinuity := seen && status&1 != 0
 			seen = true
@@ -203,7 +232,7 @@ func captureAudio(ctx context.Context, deviceID string, ready chan<- error, emit
 				return err
 			}
 		}
-		if time.Since(lastData) > 3*time.Second {
+		if !desktop && time.Since(lastData) > 3*time.Second {
 			return fmt.Errorf("микрофон перестал передавать звук")
 		}
 	}

@@ -14,14 +14,16 @@ const sampleRate = 48000
 const maxDuration = 6 * time.Hour
 const maxPeers = 7
 const defaultPort = "47652"
-const protocolVersion = 6
+const protocolVersion = 7
 
 type packet struct {
+	Desktop       bool
 	Time          int64
 	PCM           []byte
 	Discontinuity bool
 }
 type message struct {
+	Desktop       bool           `json:"desktop,omitempty"`
 	Members       []rosterMember `json:"members,omitempty"`
 	Source        uint32         `json:"source,omitempty"`
 	VoiceToken    string         `json:"voice_token,omitempty"`

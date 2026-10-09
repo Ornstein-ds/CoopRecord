@@ -14,6 +14,32 @@ type mixerChannel struct {
 	peak   atomic.Int32
 }
 
+// Native trackbars count down from the top; unity sits 65% of the way up.
+const mixerUnityPosition = 35
+
+func mixerGain(position int32) int32 {
+	position = max(0, min(100, position))
+	if position <= mixerUnityPosition {
+		return 100 + (100*(mixerUnityPosition-position)+mixerUnityPosition/2)/mixerUnityPosition
+	}
+	return (100*(100-position) + (100-mixerUnityPosition)/2) / (100 - mixerUnityPosition)
+}
+
+func mixerPosition(gain int32) int32 {
+	gain = max(0, min(200, gain))
+	if gain >= 100 {
+		return mixerUnityPosition - ((gain-100)*mixerUnityPosition+50)/100
+	}
+	return 100 - (gain*(100-mixerUnityPosition)+50)/100
+}
+
+func applyMixerGain(dst, src []byte, gain int32) {
+	for i := 0; i+1 < len(dst); i += 2 {
+		sample := int32(int16(binary.LittleEndian.Uint16(src[i:]))) * gain / 100
+		binary.LittleEndian.PutUint16(dst[i:], uint16(int16(max(-32768, min(32767, sample)))))
+	}
+}
+
 func newMixerChannel() *mixerChannel {
 	c := &mixerChannel{}
 	c.volume.Store(100)
@@ -57,7 +83,7 @@ func (v *voiceSession) setRoster(members []rosterMember) error {
 	}
 	seen := make(map[uint32]bool)
 	for _, m := range members {
-		if seen[m.Source] || strings.TrimSpace(m.Name) == "" || utf8.RuneCountInString(m.Name) > 40 || strings.ContainsAny(m.Name, "\x00\r\n") {
+		if m.Source >= desktopSource || seen[m.Source] || strings.TrimSpace(m.Name) == "" || utf8.RuneCountInString(m.Name) > 40 || strings.ContainsAny(m.Name, "\x00\r\n") {
 			return fmt.Errorf("неверный участник микшера")
 		}
 		seen[m.Source] = true
@@ -81,7 +107,7 @@ func (v *voiceSession) setRoster(members []rosterMember) error {
 	v.members = append([]rosterMember(nil), members...)
 	v.channels = channels
 	for id := range v.streams {
-		if !seen[id] {
+		if !seen[id&^desktopSource] {
 			delete(v.streams, id)
 		}
 	}
@@ -92,7 +118,7 @@ func (e *engine) mixerStrips() []mixerStrip {
 	e.mu.Lock()
 	v := e.voice
 	e.mu.Unlock()
-	strips := []mixerStrip{{"Саундпад", e.padMixer}}
+	strips := []mixerStrip{{"Саундпад", e.padMixer}, {"Звук компьютера", e.desktopMixer}}
 	if v == nil || v.ctx.Err() != nil {
 		return strips
 	}

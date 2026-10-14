@@ -79,6 +79,9 @@ type uiResult struct {
 	downloadPath string
 }
 type windowUI struct {
+	speechModel            string
+	transcriptView         *transcription
+	transcriptRevision     uint64
 	theme                  uiTheme
 	mixerChannels          [maxPeers + 2]*mixerChannel
 	padFiles               [padCount]string
@@ -216,7 +219,7 @@ func (u *windowUI) editShortcut(hwnd, key uintptr) bool {
 	if key != 'A' && key != 8 {
 		return false
 	}
-	for _, id := range []int{idName, idCorrection, idAddress, idKey, idFolder} {
+	for _, id := range []int{idName, idCorrection, idAddress, idKey, idFolder, idTranscript, idSpeechModel} {
 		if hwnd == 0 || hwnd != u.controls[id] {
 			continue
 		}
@@ -224,6 +227,9 @@ func (u *windowUI) editShortcut(hwnd, key uintptr) bool {
 			sendMessage.Call(hwnd, 0xB1, 0, ^uintptr(0))
 			return true
 		} // EM_SETSEL
+		if id == idTranscript || id == idSpeechModel {
+			return true
+		}
 		var start, end uint32
 		sendMessage.Call(hwnd, 0xB0, uintptr(unsafe.Pointer(&start)), uintptr(unsafe.Pointer(&end))) // EM_GETSEL
 		if start == end {
@@ -245,7 +251,7 @@ func (u *windowUI) combo(id int, items []string, x, y, w int) {
 
 func loadSettings() settings {
 	home, _ := os.UserHomeDir()
-	c := settings{Name: os.Getenv("USERNAME"), Folder: filepath.Join(home, "Documents", "CoopRecord"), Address: "0.0.0.0:" + defaultPort}
+	c := settings{Name: os.Getenv("USERNAME"), Folder: filepath.Join(home, "Documents", "CoopRecord"), Address: "0.0.0.0:" + defaultPort, SpeechModel: defaultSpeechModel()}
 	if path, err := os.UserConfigDir(); err == nil {
 		if b, err := os.ReadFile(filepath.Join(path, "CoopRecord", "settings.json")); err == nil {
 			_ = json.Unmarshal(b, &c)
@@ -282,6 +288,9 @@ func (u *windowUI) settings() (settings, error) {
 	c.PadKeys = u.readPadKeys()
 	c.PadKeysSet = true
 	c.Theme = u.theme.preference
+	c.SpeechModel = u.speechModel
+	c.SpeechOff = selected(u.controls[idSpeechMode]) == 2
+	c.SpeechCPU = selected(u.controls[idSpeechMode]) == 1
 	i := selected(u.controls[idMic])
 	if i >= 0 && i < len(u.devices) {
 		c.DeviceID = u.devices[i].ID
@@ -411,7 +420,7 @@ func (u *windowUI) command(id int, notification int) {
 	if notification != 0 || u.busy {
 		return
 	}
-	if u.soundpadCommand(id) {
+	if u.transcriptCommand(id) || u.soundpadCommand(id) {
 		return
 	}
 	switch id {
@@ -535,6 +544,7 @@ drained:
 	v := u.e.snapshot()
 	u.updateSoundpad(v)
 	u.updateMixer()
+	u.updateTranscript(v)
 	idle := v.Mode == "" && !u.busy
 	host := selected(u.controls[idRole]) == 0
 	for _, id := range []int{idName, idMic, idRefresh, idTest, idCorrection, idRole, idAddress, idKey} {
@@ -665,7 +675,7 @@ func main() {
 		dpi = 96
 	}
 	// Fit the taller window on smaller monitors while preserving its layout.
-	fit := min(float64(dpi)/96, min(float64(call("GetSystemMetrics", 0)-40)/1440, float64(call("GetSystemMetrics", 1)-80)/1035))
+	fit := min(float64(dpi)/96, min(float64(call("GetSystemMetrics", 0)-40)/1656, float64(call("GetSystemMetrics", 1)-80)/1035))
 	dpi = uintptr(fit * 96)
 	u := &windowUI{controls: make(map[int]uintptr), e: newEngine(captureAudio), results: make(chan uiResult, 16), scale: float64(dpi) / 96}
 	c := loadSettings()
@@ -687,7 +697,7 @@ func main() {
 		return
 	}
 	style := uint32(0x00c80000 | 0x00020000 | 0x02000000) // clip children while painting the background
-	r := rect{Right: int32(u.px(1440)), Bottom: int32(u.px(1035))}
+	r := rect{Right: int32(u.px(1656)), Bottom: int32(u.px(1035))}
 	call("AdjustWindowRectEx", uintptr(unsafe.Pointer(&r)), uintptr(style), 0, 0x10000)
 	u.hwnd = call("CreateWindowExW", 0x10000, uintptr(unsafe.Pointer(class)), uintptr(unsafe.Pointer(wide("CoopRecord v"+appVersion+" — запись подкаста"))), uintptr(style), 0x80000000, 0x80000000, uintptr(r.Right-r.Left), uintptr(r.Bottom-r.Top), 0, 0, instance, 0)
 	if u.hwnd == 0 {
@@ -706,6 +716,7 @@ func main() {
 	u.button(idTheme, "Тёмная тема", 1164, 15, 248)
 	u.button(idSystemTheme, "Как в Windows", 1164, 47, 248)
 	u.createMixer()
+	u.createTranscript(c)
 	u.role = c.Role
 	u.connections[0].address, u.connections[0].key = "0.0.0.0:"+defaultPort, sessionKey()
 	u.connections[1].address = "26.0.0.1:" + defaultPort

@@ -22,6 +22,9 @@ const (
 )
 
 func (u *windowUI) chooseSound() string {
+	return u.chooseFile("Звук для саундпада (WAV/MP3, до 2 минут)", "Звуки (*.wav;*.mp3)\x00*.wav;*.mp3\x00WAV (*.wav)\x00*.wav\x00MP3 (*.mp3)\x00*.mp3\x00\x00")
+}
+func (u *windowUI) chooseFile(title, types string) string {
 	type openFileName struct {
 		Size                         uint32
 		Owner, Instance              uintptr
@@ -40,9 +43,9 @@ func (u *windowUI) chooseSound() string {
 		Reserved                     uintptr
 		Reserved2, FlagsEx           uint32
 	}
-	filter := utf16.Encode([]rune("Звуки (*.wav;*.mp3)\x00*.wav;*.mp3\x00WAV (*.wav)\x00*.wav\x00MP3 (*.mp3)\x00*.mp3\x00\x00"))
+	filter := utf16.Encode([]rune(types))
 	var file [32768]uint16
-	info := openFileName{Owner: u.hwnd, Filter: &filter[0], File: &file[0], MaxFile: uint32(len(file)), Title: wide("Звук для саундпада (WAV/MP3, до 2 минут)"), Flags: 0x1000 | 0x800 | 0x80000 | 0x8}
+	info := openFileName{Owner: u.hwnd, Filter: &filter[0], File: &file[0], MaxFile: uint32(len(file)), Title: wide(title), Flags: 0x1000 | 0x800 | 0x80000 | 0x8}
 	info.Size = uint32(unsafe.Sizeof(info))
 	ok, _, _ := syscall.NewLazyDLL("comdlg32.dll").NewProc("GetOpenFileNameW").Call(uintptr(unsafe.Pointer(&info)))
 	if ok == 0 {

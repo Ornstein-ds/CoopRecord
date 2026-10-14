@@ -2,7 +2,7 @@ name: Windows build
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
     tags: ['v*']
   pull_request:
   workflow_dispatch:
@@ -37,6 +37,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           name: CoopRecord-windows-x64
@@ -47,9 +50,14 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
+          if git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            release_flags=(--prerelease=false --latest=true)
+          else
+            release_flags=(--prerelease=true --latest=false)
+          fi
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" dist/CoopRecord.exe dist/CoopRecord-windows-x64.zip dist/SHA256SUMS.txt --clobber
-            gh release edit "$RELEASE_TAG" --draft=false --latest --title "CoopRecord $RELEASE_TAG"
+            gh release edit "$RELEASE_TAG" --draft=false "${release_flags[@]}" --title "CoopRecord $RELEASE_TAG"
           else
-            gh release create "$RELEASE_TAG" dist/CoopRecord.exe dist/CoopRecord-windows-x64.zip dist/SHA256SUMS.txt --verify-tag --title "CoopRecord $RELEASE_TAG" --generate-notes
+            gh release create "$RELEASE_TAG" dist/CoopRecord.exe dist/CoopRecord-windows-x64.zip dist/SHA256SUMS.txt --verify-tag "${release_flags[@]}" --title "CoopRecord $RELEASE_TAG" --generate-notes
           fi

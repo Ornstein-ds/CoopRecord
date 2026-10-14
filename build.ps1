@@ -19,7 +19,8 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Build failed. Close CoopRecord if it is running.' }
     Copy-Item -LiteralPath 'README.md' -Destination 'dist/README.md' -Force
     Copy-Item -LiteralPath 'THIRD_PARTY_NOTICES.txt' -Destination 'dist/THIRD_PARTY_NOTICES.txt' -Force
-    Compress-Archive -LiteralPath 'dist/CoopRecord.exe','dist/README.md','dist/THIRD_PARTY_NOTICES.txt' -DestinationPath 'dist/CoopRecord-windows-x64.zip' -Force
+    Copy-Item -LiteralPath 'setup-transcription.ps1' -Destination 'dist/setup-transcription.ps1' -Force
+    Compress-Archive -LiteralPath 'dist/CoopRecord.exe','dist/README.md','dist/THIRD_PARTY_NOTICES.txt','dist/setup-transcription.ps1' -DestinationPath 'dist/CoopRecord-windows-x64.zip' -Force
     $checksum = (Get-FileHash -LiteralPath 'dist/CoopRecord-windows-x64.zip' -Algorithm SHA256).Hash.ToLowerInvariant()
     Set-Content -LiteralPath 'dist/SHA256SUMS.txt' -Value "$checksum  CoopRecord-windows-x64.zip" -Encoding ascii
     Write-Output "Ready: $PSScriptRoot\dist\CoopRecord.exe"

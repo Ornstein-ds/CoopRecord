@@ -19,6 +19,9 @@ import (
 )
 
 type settings struct {
+	SpeechModel                          string `json:",omitempty"`
+	SpeechCPU                            bool   `json:",omitempty"`
+	SpeechOff                            bool   `json:",omitempty"`
 	Theme                                string `json:",omitempty"`
 	PadFiles                             [padCount]string
 	PadKeys                              [padCount]uint16
@@ -28,6 +31,7 @@ type settings struct {
 	Role                                 int
 }
 type peer struct {
+	lastSpeech int64
 	padBytes   int64
 	padsReady  bool
 	w          *wire
@@ -39,6 +43,7 @@ type peer struct {
 	number     int
 }
 type recording struct {
+	transcript    *transcriptRecord
 	localDesktop  *trackWriter
 	desktopTracks map[*peer]*trackWriter
 	padEvents     *os.File
@@ -58,6 +63,10 @@ type audioEvent struct {
 }
 type captureFunc func(context.Context, string, chan<- error, func(packet) error, *atomic.Int32) error
 type engine struct {
+	speechFactory            func(context.Context, settings) (speechRecognizer, func(), error)
+	speechEnabled            atomic.Bool
+	speechDone               chan struct{}
+	transcript               *transcription
 	desktopMixer             *mixerChannel
 	desktopMuted             atomic.Bool
 	desktopMu                sync.Mutex
@@ -112,6 +121,9 @@ type viewState struct {
 func newEngine(capture captureFunc) *engine {
 	e := &engine{capture: capture, padMixer: newMixerChannel(), desktopMixer: newMixerChannel(), desktopCapture: captureDesktop, voiceOutput: renderVoice, status: "Выберите микрофон и роль сессии."}
 	e.desktopMuted.Store(true)
+	e.speechFactory = func(ctx context.Context, c settings) (speechRecognizer, func(), error) {
+		return startWhisper(ctx, c.SpeechModel, c.SpeechCPU)
+	}
 	e.playPad = func(ctx context.Context, pcm []byte, start int64) error {
 		return playPadMixed(ctx, pcm, start, e.padMixer)
 	}
@@ -232,6 +244,16 @@ func (e *engine) begin(c settings, mode string) error {
 	e.inputReady = false
 	e.peers = make(map[*peer]bool)
 	e.ctx, e.cancel = context.WithCancel(context.Background())
+	e.transcript = nil
+	e.speechDone = nil
+	e.speechEnabled.Store(mode == "host" && c.SpeechModel != "" && !c.SpeechOff)
+	if mode == "guest" || (c.SpeechModel != "" && !c.SpeechOff) {
+		ctx := e.ctx
+		e.transcript = newTranscription(ctx, nil, func(line transcriptLine) { e.publishTranscript(ctx, line) })
+		if mode == "guest" {
+			e.transcript.status = "Расшифровку выполняет хост."
+		}
+	}
 	e.voice = nil
 	e.padVoices, e.padIndex = 0, -1
 	e.padUntil, e.padCommandTime = 0, 0
@@ -260,13 +282,16 @@ func (e *engine) startInput() error {
 				return nil
 			}
 			id := e.audioID
-			if id == "" {
+			if id == "" && !e.speechEnabled.Load() {
 				return nil
 			}
 			select {
 			case audio <- audioEvent{packet: p, session: id}:
 				return nil
 			default:
+				if id == "" {
+					return nil
+				}
 				return fmt.Errorf("сеть или диск не успевает принимать звук; запись остановлена")
 			}
 		}, &e.level)
@@ -308,6 +333,11 @@ func (e *engine) processAudio(ctx context.Context, audio <-chan audioEvent) {
 			e.mu.Lock()
 			w := e.client
 			var err error
+			if e.mode == "host" && item.done == nil && !item.packet.Desktop {
+				p := item.packet
+				p.Time += int64(e.cfg.CorrectionMS) * int64(time.Millisecond)
+				e.transcript.feed(0, e.cfg.Name, p)
+			}
 			if e.mode == "host" && e.rec != nil && item.session == e.rec.id && item.done == nil {
 				track := e.rec.local
 				if item.packet.Desktop {
@@ -319,9 +349,13 @@ func (e *engine) processAudio(ctx context.Context, audio <-chan audioEvent) {
 				close(item.done)
 			}
 			e.mu.Unlock()
-			if w != nil && item.session != "" {
+			if w != nil {
 				if item.done == nil {
-					err = w.send(message{Type: "audio", Session: item.session, Time: item.packet.Time, PCM: item.packet.PCM, Discontinuity: item.packet.Discontinuity, Desktop: item.packet.Desktop})
+					kind := "audio"
+					if item.session == "" {
+						kind = "speech"
+					}
+					err = w.send(message{Type: kind, Session: item.session, Time: item.packet.Time, PCM: item.packet.PCM, Discontinuity: item.packet.Discontinuity, Desktop: item.packet.Desktop})
 				} else {
 					err = w.send(message{Type: "end", Session: item.session})
 				}
@@ -380,7 +414,11 @@ func (e *engine) host(c settings) error {
 	}
 	e.mu.Lock()
 	e.status = "Хост готов. Передайте другу IP RadminVPN, порт и ключ сессии."
+	speech := e.transcript
+	done := make(chan struct{})
+	e.speechDone = done
 	e.mu.Unlock()
+	go func() { defer close(done); e.startTranscription(ctx, c, speech) }()
 	go func() {
 		// Limit unauthenticated sockets as well as admitted participants.
 		slots := make(chan struct{}, 16)
@@ -435,6 +473,7 @@ func (e *engine) join(c settings) error {
 	}
 	var token [32]byte
 	copy(token[:], tokenBytes)
+	e.speechEnabled.Store(reply.SpeechEnabled)
 	remote := conn.RemoteAddr().(*net.TCPAddr)
 	server := &net.UDPAddr{IP: remote.IP, Port: remote.Port, Zone: remote.Zone}
 	network := "udp4"
@@ -508,6 +547,9 @@ func (e *engine) servePeer(ctx context.Context, w *wire) {
 		voice.mu.Unlock()
 		e.mu.Lock()
 		delete(e.peers, p)
+		if e.transcript != nil {
+			e.transcript.dropSource(p.number)
+		}
 		active := e.rec != nil && e.rec.tracks[p] != nil
 		if active {
 			select {
@@ -522,7 +564,7 @@ func (e *engine) servePeer(ctx context.Context, w *wire) {
 		}
 		e.broadcastRoster(ctx)
 	}()
-	if w.send(message{Type: "welcome", Version: protocolVersion, Source: uint32(p.number), VoiceToken: hex.EncodeToString(token[:])}) != nil {
+	if w.send(message{Type: "welcome", Version: protocolVersion, Source: uint32(p.number), VoiceToken: hex.EncodeToString(token[:]), SpeechEnabled: e.speechEnabled.Load()}) != nil {
 		return
 	}
 	pingCtx, cancel := context.WithCancel(ctx)
@@ -544,6 +586,18 @@ func (e *engine) servePeer(ctx context.Context, w *wire) {
 		e.mu.Lock()
 		r := e.rec
 		switch m.Type {
+		case "speech":
+			if m.Desktop || m.Session != "" || m.Time <= p.lastSpeech || len(m.PCM) == 0 || len(m.PCM)%2 != 0 || len(m.PCM) > sampleRate*2 {
+				err = fmt.Errorf("неверный блок речи")
+			} else if len(p.samples) > 0 {
+				stamp := mapClock(m.Time, clockAnchors(p.samples))
+				if abs64(stamp-received) > int64(30*time.Second) {
+					err = fmt.Errorf("неверная метка речи")
+				} else {
+					p.lastSpeech = m.Time
+					e.transcript.feed(p.number, p.name, packet{Time: stamp + int64(p.correction)*int64(time.Millisecond), PCM: m.PCM, Discontinuity: m.Discontinuity})
+				}
+			}
 		case "desktop_error":
 			e.lastError = p.name + ": звук компьютера выключен: " + m.Error
 			if r != nil {
@@ -596,6 +650,10 @@ func (e *engine) servePeer(ctx context.Context, w *wire) {
 						track = r.desktopTracks[p]
 					}
 					err = track.append(packet{Time: m.Time, PCM: m.PCM, Discontinuity: m.Discontinuity})
+					if err == nil && !m.Desktop {
+						p.lastSpeech = m.Time
+						e.transcript.feed(p.number, p.name, packet{Time: mapClock(m.Time, clockAnchors(p.samples)) + int64(p.correction)*int64(time.Millisecond), PCM: m.PCM, Discontinuity: m.Discontinuity})
+					}
 				}
 			}
 		case "end":
@@ -640,8 +698,12 @@ func (e *engine) pingPeer(ctx context.Context, p *peer) {
 			t = clockNow()
 			p.pending = t
 		}
+		speechStatus := "Расшифровка выключена у хоста."
+		if e.transcript != nil {
+			speechStatus = e.transcript.summary()
+		}
 		e.mu.Unlock()
-		if t != 0 && p.w.send(message{Type: "ping", T0: t}) != nil {
+		if t != 0 && p.w.send(message{Type: "ping", T0: t, SpeechStatus: speechStatus}) != nil {
 			p.w.Close()
 			return
 		}
@@ -672,6 +734,20 @@ func (e *engine) readHost(ctx context.Context, w *wire) {
 			return
 		}
 		switch m.Type {
+		case "transcript":
+			if m.Transcript == nil || len(m.Transcript.Text) > 8000 || len(m.Transcript.Name) > 160 || m.Transcript.Time < 0 || m.Transcript.Time > int64(7*24*time.Hour) || len(m.Transcript.Recording) > 128 {
+				err = fmt.Errorf("неверная строка расшифровки")
+			} else {
+				e.mu.Lock()
+				s := e.transcript
+				e.mu.Unlock()
+				if s != nil {
+					line := *m.Transcript
+					line.Name = cleanSpeech(line.Name)
+					line.Text = cleanSpeech(line.Text)
+					s.addLine(line)
+				}
+			}
 		case "roster":
 			e.mu.Lock()
 			v := e.voice
@@ -694,6 +770,14 @@ func (e *engine) readHost(ctx context.Context, w *wire) {
 			}
 			e.mu.Unlock()
 		case "ping":
+			if len(m.SpeechStatus) <= 4096 {
+				e.mu.Lock()
+				s := e.transcript
+				e.mu.Unlock()
+				if s != nil {
+					s.setStatus(m.SpeechStatus)
+				}
+			}
 			err = w.send(message{Type: "pong", T0: m.T0, T1: received, T2: clockNow()})
 		case "start":
 			e.mu.Lock()
@@ -796,6 +880,9 @@ func (e *engine) startRecording() error {
 		// Copying the sound bank can take longer than the one-second start lead.
 		r.m.Start = clockNow() + int64(time.Second)
 		err = saveManifest(dir, r.m)
+		if err == nil && e.transcript != nil {
+			r.transcript, err = e.transcript.beginRecord(dir, r.id, r.m.Start)
+		}
 	}
 	if err != nil {
 		if r.padEvents != nil {
@@ -870,6 +957,7 @@ func (e *engine) stopRecording() error {
 	}
 	r.stopping = true
 	r.m.End = max(clockNow(), r.m.Start+int64(time.Millisecond))
+	e.transcript.endRecord(r.transcript, r.m.End)
 	e.status = "Получение последних аудиоблоков…"
 	localDone := make(chan struct{})
 	e.inputMu.Lock()
@@ -905,6 +993,16 @@ func (e *engine) stopRecording() error {
 		}
 	}
 	e.mu.Lock()
+	speech := e.transcript
+	if r.transcript != nil {
+		e.status = "Распознавание последних реплик и сохранение transcript.md…"
+	}
+	e.mu.Unlock()
+	transcriptErr := speech.finishRecord(r.transcript)
+	e.mu.Lock()
+	if transcriptErr != nil {
+		r.m.Warnings = append(r.m.Warnings, "Расшифровка неполная: "+transcriptErr.Error())
+	}
 	if timedOut {
 		r.m.Warnings = append(r.m.Warnings, "Не все последние блоки получены за 10 секунд; дорожки могут оканчиваться тишиной.")
 		for p := range r.tracks {
@@ -955,7 +1053,13 @@ func (e *engine) disconnect() {
 	e.mu.Unlock()
 	_ = e.stopRecording()
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	done := e.speechDone
+	defer func() {
+		e.mu.Unlock()
+		if done != nil {
+			<-done
+		}
+	}()
 	if e.cancel != nil {
 		e.cancel()
 	}

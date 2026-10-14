@@ -22,6 +22,9 @@ const (
 )
 
 func (u *windowUI) chooseSound() string {
+	return u.chooseFile("Звук для саундпада (WAV/MP3, до 2 минут)", "Звуки (*.wav;*.mp3)\x00*.wav;*.mp3\x00WAV (*.wav)\x00*.wav\x00MP3 (*.mp3)\x00*.mp3\x00\x00")
+}
+func (u *windowUI) chooseFile(title, types string) string {
 	type openFileName struct {
 		Size                         uint32
 		Owner, Instance              uintptr
@@ -40,9 +43,9 @@ func (u *windowUI) chooseSound() string {
 		Reserved                     uintptr
 		Reserved2, FlagsEx           uint32
 	}
-	filter := utf16.Encode([]rune("Звуки (*.wav;*.mp3)\x00*.wav;*.mp3\x00WAV (*.wav)\x00*.wav\x00MP3 (*.mp3)\x00*.mp3\x00\x00"))
+	filter := utf16.Encode([]rune(types))
 	var file [32768]uint16
-	info := openFileName{Owner: u.hwnd, Filter: &filter[0], File: &file[0], MaxFile: uint32(len(file)), Title: wide("Звук для саундпада (WAV/MP3, до 2 минут)"), Flags: 0x1000 | 0x800 | 0x80000 | 0x8}
+	info := openFileName{Owner: u.hwnd, Filter: &filter[0], File: &file[0], MaxFile: uint32(len(file)), Title: wide(title), Flags: 0x1000 | 0x800 | 0x80000 | 0x8}
 	info.Size = uint32(unsafe.Sizeof(info))
 	ok, _, _ := syscall.NewLazyDLL("comdlg32.dll").NewProc("GetOpenFileNameW").Call(uintptr(unsafe.Pointer(&info)))
 	if ok == 0 {
@@ -53,24 +56,23 @@ func (u *windowUI) chooseSound() string {
 
 func (u *windowUI) createSoundpad(c settings) {
 	u.padFiles = c.PadFiles
-	u.label("Саундпад · 9 звуков для всей сессии", 746, 22, 405)
-	u.label("WAV / MP3 · горячие клавиши на каждом ПК", 746, 49, 405)
+	u.label("Саундпад · 9 звуков для всей сессии", soundpadLeft, 22, soundpadWidth)
+	u.label("WAV / MP3 · горячие клавиши на каждом ПК", soundpadLeft, 49, soundpadWidth)
 	for i := 0; i < padCount; i++ {
-		x, y := 746+(i%3)*170, 82+(i/3)*125
-		u.control(idPadFirst+i, "BUTTON", fmt.Sprintf("%d\r\nПусто", i+1), 0x10000|0x2000, x, y, 96, 96)
-		u.button(idPadLoadFirst+i, "Файл…", x+101, y, 64)
-		u.button(idPadClearFirst+i, "Убрать", x+101, y+35, 64)
-		u.label("Клавиша:", x+101, y+76, 66)
-		u.control(idPadKeyFirst+i, "msctls_hotkey32", "", 0x10000, x, y+99, 165, 23)
+		x, y := soundpadLeft+(i%3)*142, 82+(i/3)*101
+		u.control(idPadFirst+i, "BUTTON", fmt.Sprintf("%d\r\nПусто", i+1), 0x10000|0x2000, x, y, 63, 63)
+		u.button(idPadLoadFirst+i, "Файл…", x+68, y, 64)
+		u.button(idPadClearFirst+i, "Убрать", x+68, y+35, 64)
+		u.control(idPadKeyFirst+i, "msctls_hotkey32", "", 0x10000, x, y+68, 132, 23)
 		key := c.PadKeys[i]
 		if !c.PadKeysSet {
 			key = uint16('1'+i) | 6<<8
 		}
 		sendMessage.Call(u.controls[idPadKeyFirst+i], 0x401, uintptr(key), 0) // HKM_SETHOTKEY
 	}
-	u.button(idPadApply, "Применить горячие клавиши", 746, 619, 270)
-	u.control(idPadProgress, "msctls_progress32", "Загрузка саундпада", 0, 1030, 624, 382, 20)
-	u.control(idPadStatus, "EDIT", "", 0x200844, 746, 654, 666, 32)
+	u.button(idPadApply, "Применить горячие клавиши", soundpadLeft, 389, 240)
+	u.control(idPadProgress, "msctls_progress32", "Загрузка саундпада", 0, soundpadLeft+254, 394, 162, 18)
+	u.control(idPadStatus, "EDIT", "", 0x200844, soundpadLeft, 427, soundpadWidth, 44)
 }
 
 func (u *windowUI) readPadKeys() [padCount]uint16 {

@@ -13,6 +13,54 @@ import (
 	"unsafe"
 )
 
+func TestCustomFrameClientSize(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	var frameUI *windowUI
+	proc := syscall.NewCallback(func(hwnd uintptr, msg uint32, w, l uintptr) uintptr {
+		if msg == 0x24 { // Exercise large DPI sizes without the monitor's maximum track size clamping the test window.
+			call("DefWindowProcW", hwnd, uintptr(msg), w, l)
+			info := *(**[10]int32)(unsafe.Pointer(&l))
+			info[8], info[9] = 10000, 10000
+			return 0
+		}
+		if msg == 0x83 && frameUI != nil {
+			if result, handled := frameUI.themeMessage(hwnd, msg, w, l); handled {
+				return result
+			}
+		}
+		return call("DefWindowProcW", hwnd, uintptr(msg), w, l)
+	})
+	instance, _, _ := kernel.NewProc("GetModuleHandleW").Call(0)
+	class := wide("CoopRecordFrameSizeTest")
+	wc := winClass{Size: uint32(unsafe.Sizeof(winClass{})), Proc: proc, Instance: instance, Class: class}
+	if call("RegisterClassExW", uintptr(unsafe.Pointer(&wc))) == 0 {
+		t.Fatal("frame test class")
+	}
+	defer call("UnregisterClassW", uintptr(unsafe.Pointer(class)), instance)
+	const style uint32 = 0x00c80000 | 0x00020000 | 0x02000000
+	for _, scale := range []float64{0.75, 1, 1.25, 1.5, 2} {
+		u := &windowUI{scale: scale, theme: uiTheme{enabled: true}}
+		frameUI = u
+		r := u.windowRect(style)
+		h := call("CreateWindowExW", 0x10000, uintptr(unsafe.Pointer(class)), 0, uintptr(style), 0, 0, uintptr(r.Right-r.Left), uintptr(r.Bottom-r.Top), 0, 0, instance, 0)
+		if h == 0 {
+			t.Fatal("frame test window")
+		}
+		call("SetWindowPos", h, 0, 0, 0, 0, 0, 0x27)
+		var client rect
+		call("GetClientRect", h, uintptr(unsafe.Pointer(&client)))
+		call("DestroyWindow", h)
+		if client.Right != int32(u.px(windowWidth)) || client.Bottom != int32(u.px(windowHeight)) {
+			t.Fatal("extra native frame space", scale, client)
+		}
+		bottom := int32(u.px(mixerTop + 295 + 32))
+		if client.Bottom-bottom > int32(u.px(16)) || client.Bottom < bottom {
+			t.Fatal("unwanted bottom padding", scale, client.Bottom-bottom)
+		}
+	}
+}
+
 func TestComboBoundsAndIdleRepaint(t *testing.T) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()

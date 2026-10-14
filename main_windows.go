@@ -27,6 +27,18 @@ var sendMessage = user32.NewProc("SendMessageW")
 var appUI *windowUI
 
 const (
+	windowWidth     = 1335
+	windowHeight    = 964
+	soundpadLeft    = 540
+	soundpadWidth   = 416
+	transcriptLeft  = 980
+	transcriptWidth = 339
+	mixerLeft       = 26
+	mixerTop        = 624
+	mixerWidth      = soundpadLeft + soundpadWidth - mixerLeft - 10
+)
+
+const (
 	idName = 101 + iota
 	idMic
 	idRefresh
@@ -79,27 +91,29 @@ type uiResult struct {
 	downloadPath string
 }
 type windowUI struct {
-	speechModel            string
-	transcriptView         *transcription
-	transcriptRevision     uint64
-	theme                  uiTheme
-	mixerChannels          [maxPeers + 2]*mixerChannel
-	padFiles               [padCount]string
-	padLabels              [padCount]string
-	lastPadStatus          string
-	lastVoiceStatus        string
-	hwnd, font, titleFont  uintptr
-	controls               map[int]uintptr
-	devices                []inputDevice
-	e                      *engine
-	scale                  float64
-	busy                   bool
-	results                chan uiResult
-	testCancel             context.CancelFunc
-	testDone               chan struct{}
-	lastStatus, lastPeople string
-	role                   int
-	connections            [2]struct{ address, key string }
+	mixerOffset, mixerCount, mixerPage int
+	mixerLayout                        [maxPeers + 2]int
+	speechModel                        string
+	transcriptView                     *transcription
+	transcriptRevision                 uint64
+	theme                              uiTheme
+	mixerChannels                      [maxPeers + 2]*mixerChannel
+	padFiles                           [padCount]string
+	padLabels                          [padCount]string
+	lastPadStatus                      string
+	lastVoiceStatus                    string
+	hwnd, font, titleFont              uintptr
+	controls                           map[int]uintptr
+	devices                            []inputDevice
+	e                                  *engine
+	scale                              float64
+	busy                               bool
+	results                            chan uiResult
+	testCancel                         context.CancelFunc
+	testDone                           chan struct{}
+	lastStatus, lastPeople             string
+	role                               int
+	connections                        [2]struct{ address, key string }
 }
 
 func wide(s string) *uint16 { p, _ := syscall.UTF16PtrFromString(s); return p }
@@ -150,7 +164,7 @@ func (u *windowUI) control(id int, class, text string, style uint32, x, y, w, h 
 	if u.theme.enabled && class == "BUTTON" {
 		if style&15 == 7 {
 			u.theme.cards = append(u.theme.cards, rect{int32(u.px(x)), int32(u.px(y + 9)), int32(u.px(x + w)), int32(u.px(y + h))})
-			return u.control(id, "STATIC", text, 0, x+14, y-30, w-28, 20)
+			return u.control(id, "STATIC", text, 0, x+10, y-30, w-20, 18)
 		}
 		style = style&^15 | 11 // BS_OWNERDRAW; Windows still handles input and focus.
 	}
@@ -606,6 +620,11 @@ func windowProc(hwnd uintptr, msg uint32, w, l uintptr) uintptr {
 		}
 	}
 	switch msg {
+	case 0x114: // WM_HSCROLL: horizontal mixer strip navigation.
+		if u != nil && l == u.controls[idMixerScroll] {
+			u.scrollMixer(int(w&0xffff), int((w>>16)&0xffff))
+			return 0
+		}
 	case 0x115: // WM_VSCROLL: native vertical trackbars, including keyboard changes.
 		if u != nil {
 			u.mixerScroll(l)
@@ -650,6 +669,68 @@ func windowProc(hwnd uintptr, msg uint32, w, l uintptr) uintptr {
 	return call("DefWindowProcW", hwnd, uintptr(msg), w, l)
 }
 
+func (u *windowUI) createControls(c settings) {
+	title := u.control(0, "STATIC", "CoopRecord", 0, 18, 12, 170, 34)
+	sendMessage.Call(title, 0x30, u.titleFont, 1)
+	u.label("v"+appVersion, 196, 23, 80)
+	u.button(idUpdate, "Обновить приложение", 350, 15, 166)
+	u.label("Совместная запись  ·  WAV 48 кГц / 16 бит  ·  Windows x64", 18, 47, 498)
+	u.control(0, "BUTTON", "1. Ваш звук", 7, 16, 78, 500, 126)
+	u.createSoundpad(c)
+	u.button(idTheme, "Тёмная тема", soundpadLeft, 550, 202)
+	u.button(idSystemTheme, "Как в Windows", soundpadLeft+214, 550, 202)
+	u.createMixer()
+	u.createTranscript(c)
+	u.role = c.Role
+	u.connections[0].address, u.connections[0].key = "0.0.0.0:"+defaultPort, sessionKey()
+	u.connections[1].address = "26.0.0.1:" + defaultPort
+	u.connections[c.Role].address, u.connections[c.Role].key = c.Address, c.Key
+	u.label("Ваше имя:", 26, 104, 86)
+	u.edit(idName, c.Name, 120, 99, 148)
+	u.label("Поправка, мс:", 286, 104, 100)
+	u.edit(idCorrection, strconv.Itoa(c.CorrectionMS), 396, 99, 110)
+	u.label("Микрофон:", 26, 139, 86)
+	u.combo(idMic, nil, 120, 132, 280)
+	u.button(idRefresh, "Обновить", 410, 130, 96)
+	u.button(idTest, "Проверить звук", 26, 167, 130)
+	u.control(idLevel, "msctls_progress32", "Уровень микрофона", 0, 166, 172, 340, 18)
+	u.control(0, "BUTTON", "2. Сессия", 7, 16, 216, 500, 168)
+	u.label("Ваша роль:", 26, 243, 86)
+	u.combo(idRole, []string{"Хост — сохраняет файлы", "Участник — отправляет звук"}, 120, 238, 260)
+	sendMessage.Call(u.controls[idRole], 0x14e, uintptr(c.Role), 0)
+	u.label("Адрес:", 26, 277, 86)
+	u.edit(idAddress, c.Address, 120, 272, 180)
+	u.label("IP RadminVPN : порт", 310, 277, 196)
+	u.label("Ключ сессии:", 26, 311, 86)
+	u.edit(idKey, c.Key, 120, 306, 200)
+	u.button(idNewKey, "Новый ключ", 330, 304, 176)
+	u.label("Папка хоста:", 26, 345, 86)
+	u.edit(idFolder, c.Folder, 120, 340, 280)
+	u.button(idBrowse, "Обзор…", 410, 338, 96)
+	u.control(0, "BUTTON", "3. Участники и запись", 7, 16, 396, 500, 88)
+	u.control(idPeople, "EDIT", "", 0x200844, 26, 418, 306, 52)
+	timer := u.control(idTimer, "STATIC", "00:00:00", 0, 348, 415, 158, 36)
+	sendMessage.Call(timer, 0x30, u.titleFont, 1)
+	u.label("Управляет хост", 348, 458, 158)
+	u.button(idConnect, "Создать сессию", 16, 496, 126)
+	u.button(idRecord, "Начать запись", 150, 496, 120)
+	u.button(idStop, "Стоп", 278, 496, 72)
+	u.button(idOpen, "Открыть папку", 358, 496, 158)
+	u.control(idStatus, "EDIT", "", 0x200844, 16, 534, 500, 38)
+	u.button(idRecover, "Восстановить WAV…", 16, 582, 172)
+	u.label("Голос включён. Используйте наушники.", 200, 589, 316)
+	u.control(idVoiceStatus, "EDIT", "", 0x200844, soundpadLeft, 484, soundpadWidth, 52)
+}
+
+func (u *windowUI) windowRect(style uint32) rect {
+	r := rect{Right: int32(u.px(windowWidth)), Bottom: int32(u.px(windowHeight))}
+	// The custom frame already includes its caption in the client area.
+	if !u.theme.enabled {
+		call("AdjustWindowRectEx", uintptr(unsafe.Pointer(&r)), uintptr(style), 0, 0x10000)
+	}
+	return r
+}
+
 func main() {
 	if len(os.Args) == 3 && os.Args[1] == "--recover" {
 		_, err := exportSession(os.Args[2])
@@ -675,7 +756,7 @@ func main() {
 		dpi = 96
 	}
 	// Fit the taller window on smaller monitors while preserving its layout.
-	fit := min(float64(dpi)/96, min(float64(call("GetSystemMetrics", 0)-40)/1656, float64(call("GetSystemMetrics", 1)-80)/1035))
+	fit := min(float64(dpi)/96, min(float64(call("GetSystemMetrics", 0)-40)/windowWidth, float64(call("GetSystemMetrics", 1)-80)/windowHeight))
 	dpi = uintptr(fit * 96)
 	u := &windowUI{controls: make(map[int]uintptr), e: newEngine(captureAudio), results: make(chan uiResult, 16), scale: float64(dpi) / 96}
 	c := loadSettings()
@@ -697,8 +778,7 @@ func main() {
 		return
 	}
 	style := uint32(0x00c80000 | 0x00020000 | 0x02000000) // clip children while painting the background
-	r := rect{Right: int32(u.px(1656)), Bottom: int32(u.px(1035))}
-	call("AdjustWindowRectEx", uintptr(unsafe.Pointer(&r)), uintptr(style), 0, 0x10000)
+	r := u.windowRect(style)
 	u.hwnd = call("CreateWindowExW", 0x10000, uintptr(unsafe.Pointer(class)), uintptr(unsafe.Pointer(wide("CoopRecord v"+appVersion+" — запись подкаста"))), uintptr(style), 0x80000000, 0x80000000, uintptr(r.Right-r.Left), uintptr(r.Bottom-r.Top), 0, 0, instance, 0)
 	if u.hwnd == 0 {
 		messageBox(0, "Не удалось создать окно.", 0x10)
@@ -706,57 +786,7 @@ func main() {
 	}
 	call("SetWindowPos", u.hwnd, 0, 0, 0, 0, 0, 0x27)
 	syscall.NewLazyDLL("comctl32.dll").NewProc("InitCommonControls").Call()
-	title := u.control(0, "STATIC", "CoopRecord", 0, 22, 12, 350, 34)
-	sendMessage.Call(title, 0x30, u.titleFont, 1)
-	u.label("v"+appVersion, 403, 23, 80)
-	u.button(idUpdate, "Обновить приложение", 505, 15, 195)
-	u.label("Совместная запись подкаста  ·  WAV 48 кГц / 16 бит  ·  Windows x64", 24, 47, 680)
-	u.control(0, "BUTTON", "1. Ваш звук", 7, 20, 78, 680, 143)
-	u.createSoundpad(c)
-	u.button(idTheme, "Тёмная тема", 1164, 15, 248)
-	u.button(idSystemTheme, "Как в Windows", 1164, 47, 248)
-	u.createMixer()
-	u.createTranscript(c)
-	u.role = c.Role
-	u.connections[0].address, u.connections[0].key = "0.0.0.0:"+defaultPort, sessionKey()
-	u.connections[1].address = "26.0.0.1:" + defaultPort
-	u.connections[c.Role].address, u.connections[c.Role].key = c.Address, c.Key
-	u.label("Ваше имя:", 34, 106, 103)
-	u.edit(idName, c.Name, 145, 101, 240)
-	u.label("Поправка, мс:", 433, 106, 110)
-	u.edit(idCorrection, strconv.Itoa(c.CorrectionMS), 554, 101, 128)
-	u.label("Микрофон:", 34, 143, 104)
-	u.combo(idMic, nil, 145, 137, 423)
-	u.button(idRefresh, "Обновить", 578, 135, 105)
-	u.button(idTest, "Проверить звук", 145, 178, 145)
-	u.control(idLevel, "msctls_progress32", "Уровень микрофона", 0, 304, 183, 230, 18)
-	u.label("Уровень сигнала", 550, 182, 140)
-	u.control(0, "BUTTON", "2. Сессия", 7, 20, 232, 680, 193)
-	u.label("Ваша роль:", 34, 261, 104)
-	u.combo(idRole, []string{"Хост — сохраняет файлы", "Участник — отправляет звук"}, 145, 254, 310)
-	sendMessage.Call(u.controls[idRole], 0x14e, uintptr(c.Role), 0)
-	u.label("Адрес:", 34, 299, 100)
-	u.edit(idAddress, c.Address, 145, 292, 310)
-	u.label("IP RadminVPN : порт", 472, 298, 213)
-	u.label("Ключ сессии:", 34, 336, 108)
-	u.edit(idKey, c.Key, 145, 330, 310)
-	u.button(idNewKey, "Новый ключ", 473, 328, 210)
-	u.label("Папка хоста:", 34, 377, 108)
-	u.edit(idFolder, c.Folder, 145, 371, 423)
-	u.button(idBrowse, "Обзор…", 578, 369, 105)
-	u.control(0, "BUTTON", "3. Участники и запись", 7, 20, 437, 680, 110)
-	u.control(idPeople, "EDIT", "", 0x200844, 34, 461, 390, 69)
-	timer := u.control(idTimer, "STATIC", "00:00:00", 0, 475, 461, 190, 36)
-	sendMessage.Call(timer, 0x30, u.titleFont, 1)
-	u.label("Начало и стоп — у хоста", 458, 506, 228)
-	u.button(idConnect, "Создать сессию", 20, 561, 175)
-	u.button(idRecord, "Начать запись", 205, 561, 170)
-	u.button(idStop, "Стоп", 385, 561, 120)
-	u.button(idOpen, "Открыть папку", 515, 561, 185)
-	u.control(idStatus, "EDIT", "", 0x200844, 20, 601, 680, 46)
-	u.button(idRecover, "Восстановить WAV…", 20, 656, 195)
-	u.label("Голос включён в сессии. Используйте наушники.", 230, 662, 476)
-	u.control(idVoiceStatus, "EDIT", "", 0x200844, 746, 480, 666, 60)
+	u.createControls(c)
 	u.applyTheme()
 	u.refreshDevices(c.DeviceID)
 	if err := u.applyPadKeys(); err != nil {

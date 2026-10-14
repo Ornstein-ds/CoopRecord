@@ -26,7 +26,7 @@ func TestTranscriptPanelScrollAndBounds(t *testing.T) {
 		var bounds rect
 		call("GetWindowRect", h, uintptr(unsafe.Pointer(&bounds)))
 		call("MapWindowPoints", 0, parent, uintptr(unsafe.Pointer(&bounds)), 2)
-		if bounds.Right > int32(u.px(1656)) || bounds.Bottom > int32(u.px(1035)) {
+		if bounds.Right > int32(u.px(windowWidth)) || bounds.Bottom > int32(u.px(windowHeight)) {
 			t.Fatal("panel outside window", bounds)
 		}
 		var text strings.Builder

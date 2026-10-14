@@ -21,9 +21,9 @@ func (u *windowUI) createTranscript(c settings) {
 	if u.speechModel == "" {
 		u.speechModel = defaultSpeechModel()
 	}
-	u.label("Расшифровка", 1436, 22, 200)
-	u.label("Локально · русский язык", 1436, 49, 200)
-	u.combo(idSpeechMode, []string{"GPU · Vulkan", "CPU", "Выключена"}, 1436, 85, 200)
+	u.label("Расшифровка", transcriptLeft, 22, transcriptWidth)
+	u.label("Локально · русский язык", transcriptLeft, 49, transcriptWidth)
+	u.combo(idSpeechMode, []string{"GPU · Vulkan", "CPU", "Выключена"}, transcriptLeft, 85, transcriptWidth)
 	mode := 0
 	if c.SpeechCPU {
 		mode = 1
@@ -32,10 +32,10 @@ func (u *windowUI) createTranscript(c settings) {
 		mode = 2
 	}
 	sendMessage.Call(u.controls[idSpeechMode], 0x14e, uintptr(mode), 0)
-	u.control(idSpeechModel, "EDIT", filepath.Base(u.speechModel), 0x804, 1436, 122, 200, 52)
-	u.button(idSpeechChoose, "Выбрать модель…", 1436, 181, 200)
-	u.control(idSpeechStatus, "EDIT", "", 0x804, 1436, 220, 200, 95)
-	u.control(idTranscript, "EDIT", "", 0x210844, 1436, 325, 200, 673)
+	u.control(idSpeechModel, "EDIT", filepath.Base(u.speechModel), 0x804, transcriptLeft, 122, transcriptWidth, 52)
+	u.button(idSpeechChoose, "Выбрать модель…", transcriptLeft, 181, transcriptWidth)
+	u.control(idSpeechStatus, "EDIT", "", 0x804, transcriptLeft, 220, transcriptWidth, 52)
+	u.control(idTranscript, "EDIT", "", 0x210844, transcriptLeft, 282, transcriptWidth, windowHeight-330)
 	sendMessage.Call(u.controls[idTranscript], 0xC5, 8<<20, 0)
 }
 func (u *windowUI) transcriptCommand(id int) bool {

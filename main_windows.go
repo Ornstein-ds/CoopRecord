@@ -27,12 +27,12 @@ var sendMessage = user32.NewProc("SendMessageW")
 var appUI *windowUI
 
 const (
-	windowWidth     = 1335
+	windowWidth     = 1635
 	windowHeight    = 964
 	soundpadLeft    = 540
 	soundpadWidth   = 416
 	transcriptLeft  = 980
-	transcriptWidth = 339
+	transcriptWidth = 639
 	mixerLeft       = 26
 	mixerTop        = 624
 	mixerWidth      = soundpadLeft + soundpadWidth - mixerLeft - 10
@@ -96,6 +96,7 @@ type windowUI struct {
 	speechModel                        string
 	transcriptView                     *transcription
 	transcriptRevision                 uint64
+	timeline                           *transcriptTimeline
 	theme                              uiTheme
 	mixerChannels                      [maxPeers + 2]*mixerChannel
 	padFiles                           [padCount]string
@@ -233,7 +234,7 @@ func (u *windowUI) editShortcut(hwnd, key uintptr) bool {
 	if key != 'A' && key != 8 {
 		return false
 	}
-	for _, id := range []int{idName, idCorrection, idAddress, idKey, idFolder, idTranscript, idSpeechModel} {
+	for _, id := range []int{idName, idCorrection, idAddress, idKey, idFolder, idSpeechModel} {
 		if hwnd == 0 || hwnd != u.controls[id] {
 			continue
 		}
@@ -241,7 +242,7 @@ func (u *windowUI) editShortcut(hwnd, key uintptr) bool {
 			sendMessage.Call(hwnd, 0xB1, 0, ^uintptr(0))
 			return true
 		} // EM_SETSEL
-		if id == idTranscript || id == idSpeechModel {
+		if id == idSpeechModel {
 			return true
 		}
 		var start, end uint32

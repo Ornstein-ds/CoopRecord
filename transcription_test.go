@@ -81,7 +81,10 @@ func TestTranscriptSilenceAndNonblockingCapture(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		s.feed(0, "Хост", speechPacket(start+int64(i)*20e6, 0))
 	}
-	if len(s.jobs) != 0 {
+	s.mu.Lock()
+	queued := s.queueSize()
+	s.mu.Unlock()
+	if queued != 0 {
 		t.Fatal("silence queued")
 	}
 	r, err := s.beginRecord(t.TempDir(), "test", start+2e9)

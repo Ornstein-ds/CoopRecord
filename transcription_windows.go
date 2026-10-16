@@ -31,7 +31,7 @@ func defaultSpeechModel() string {
 	return filepath.Join(filepath.Dir(exe), "stt", "ggml-large-v3-turbo-q5_0.bin")
 }
 
-// One model per host, loaded once. The random URL and loopback binding keep the
+// One model per source, loaded lazily. The random URL and loopback binding keep the
 // upstream server's model-loading/upload endpoints out of the session network.
 func startWhisper(ctx context.Context, model string, cpu bool) (speechRecognizer, func(), error) {
 	exe, _ := os.Executable()
@@ -57,7 +57,7 @@ func startWhisper(ctx context.Context, model string, cpu bool) (speechRecognizer
 	}
 	cmd := exec.CommandContext(child, server, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: 0x08000000}
-	log, err := os.OpenFile(filepath.Join(filepath.Dir(server), "whisper.log"), os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	log, err := os.CreateTemp(filepath.Dir(server), "whisper-*.log")
 	if err != nil {
 		cancel()
 		return nil, nil, err
@@ -84,10 +84,10 @@ func startWhisper(ctx context.Context, model string, cpu bool) (speechRecognizer
 			return nil, nil, ctx.Err()
 		case <-done:
 			cancel()
-			return nil, nil, fmt.Errorf("Whisper завершился при загрузке; подробности в stt/whisper.log")
+			return nil, nil, fmt.Errorf("Whisper завершился при загрузке; журнал: %s", log.Name())
 		case <-timeout.C:
 			closeServer()
-			return nil, nil, fmt.Errorf("Whisper не загрузился за 2 минуты; проверьте stt/whisper.log")
+			return nil, nil, fmt.Errorf("Whisper не загрузился за 2 минуты; журнал: %s", log.Name())
 		case <-ticker.C:
 			req, _ := http.NewRequestWithContext(ctx, "GET", base+"/health", nil)
 			resp, err := client.Do(req)

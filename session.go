@@ -735,7 +735,7 @@ func (e *engine) readHost(ctx context.Context, w *wire) {
 		}
 		switch m.Type {
 		case "transcript":
-			if m.Transcript == nil || len(m.Transcript.Text) > 8000 || len(m.Transcript.Name) > 160 || m.Transcript.Time < 0 || m.Transcript.Time > int64(7*24*time.Hour) || len(m.Transcript.Recording) > 128 {
+			if m.Transcript == nil || m.Transcript.ID == 0 || m.Transcript.Source < 0 || m.Transcript.At <= 0 || m.Transcript.EndAt <= m.Transcript.At || m.Transcript.EndAt-m.Transcript.At > int64(13*time.Second) || len(m.Transcript.Text) > 8000 || len(m.Transcript.Name) > 160 || m.Transcript.Time < 0 || m.Transcript.Time > int64(7*24*time.Hour) || len(m.Transcript.Recording) > 128 {
 				err = fmt.Errorf("неверная строка расшифровки")
 			} else {
 				e.mu.Lock()

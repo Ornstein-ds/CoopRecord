@@ -136,8 +136,10 @@ func TestDynamicMixerLayoutAndScroll(t *testing.T) {
 		if call("GetCapture") == drag || u.mixerCount != 2 || layout == u.mixerLayout {
 			t.Fatal("removed drag remained active")
 		}
-		chat := u.theme.fields[u.controls[idTranscript]]
-		if chat.Right-chat.Left != int32(u.px(transcriptLeft+transcriptWidth))-int32(u.px(transcriptLeft)) {
+		var chat rect
+		call("GetWindowRect", u.controls[idTranscript], uintptr(unsafe.Pointer(&chat)))
+		call("MapWindowPoints", 0, u.hwnd, uintptr(unsafe.Pointer(&chat)), 2)
+		if abs64(int64(chat.Right-chat.Left)-int64(u.px(transcriptWidth))) > 1 {
 			t.Fatal("chat width", chat)
 		}
 		gap := int32(u.px(transcriptLeft)) - int32(u.px(soundpadLeft+soundpadWidth))

@@ -14,7 +14,7 @@ const sampleRate = 48000
 const maxDuration = 6 * time.Hour
 const maxPeers = 7
 const defaultPort = "47652"
-const protocolVersion = 8
+const protocolVersion = 9
 
 type packet struct {
 	Desktop       bool

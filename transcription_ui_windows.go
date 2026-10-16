@@ -1,11 +1,7 @@
 package main
 
 import (
-	"fmt"
 	"path/filepath"
-	"sort"
-	"strings"
-	"unsafe"
 )
 
 const (
@@ -14,6 +10,7 @@ const (
 	idSpeechChoose
 	idSpeechStatus
 	idTranscript
+	idTranscriptCopy
 )
 
 func (u *windowUI) createTranscript(c settings) {
@@ -22,7 +19,7 @@ func (u *windowUI) createTranscript(c settings) {
 		u.speechModel = defaultSpeechModel()
 	}
 	u.label("Расшифровка", transcriptLeft, 22, transcriptWidth)
-	u.label("Локально · русский язык", transcriptLeft, 49, transcriptWidth)
+	u.label("Колонки участников · общая шкала времени · русский язык", transcriptLeft, 49, transcriptWidth)
 	u.combo(idSpeechMode, []string{"GPU · Vulkan", "CPU", "Выключена"}, transcriptLeft, 85, transcriptWidth)
 	mode := 0
 	if c.SpeechCPU {
@@ -34,11 +31,18 @@ func (u *windowUI) createTranscript(c settings) {
 	sendMessage.Call(u.controls[idSpeechMode], 0x14e, uintptr(mode), 0)
 	u.control(idSpeechModel, "EDIT", filepath.Base(u.speechModel), 0x804, transcriptLeft, 122, transcriptWidth, 52)
 	u.button(idSpeechChoose, "Выбрать модель…", transcriptLeft, 181, transcriptWidth)
-	u.control(idSpeechStatus, "EDIT", "", 0x804, transcriptLeft, 220, transcriptWidth, 52)
-	u.control(idTranscript, "EDIT", "", 0x210844, transcriptLeft, 282, transcriptWidth, windowHeight-330)
-	sendMessage.Call(u.controls[idTranscript], 0xC5, 8<<20, 0)
+	u.control(idSpeechStatus, "EDIT", "", 0x804, transcriptLeft, 220, transcriptWidth-170, 52)
+	u.button(idTranscriptCopy, "Копировать текст", transcriptLeft+transcriptWidth-160, 220, 160)
+	u.control(idTranscript, "STATIC", "", 0x100|0x30000|0x100000|0x200000, transcriptLeft, 282, transcriptWidth, windowHeight-330)
+	u.timeline = newTranscriptTimeline(u, u.controls[idTranscript])
 }
 func (u *windowUI) transcriptCommand(id int) bool {
+	if id == idTranscriptCopy {
+		if err := u.timeline.copyText(); err != nil {
+			messageBox(u.hwnd, err.Error(), 0x10)
+		}
+		return true
+	}
 	if id != idSpeechChoose {
 		return false
 	}
@@ -63,6 +67,10 @@ func (u *windowUI) updateTranscript(v viewState) {
 	s := u.e.transcript
 	u.e.mu.Unlock()
 	if s == nil {
+		if u.transcriptView != nil {
+			u.transcriptView = nil
+			u.timeline.update(nil)
+		}
 		text := "Выберите модель до создания сессии. Текст сохраняется в transcript.md рядом с WAV."
 		if !host {
 			text = "Модель нужна только хосту. Здесь появится текст разговора."
@@ -83,52 +91,5 @@ func (u *windowUI) updateTranscript(v viewState) {
 		return
 	}
 	u.transcriptRevision = revision
-	sort.SliceStable(lines, func(i, j int) bool { return lines[i].At < lines[j].At })
-	var text strings.Builder
-	lastRecord := "\x00"
-	for _, line := range lines {
-		if line.Recording != lastRecord {
-			label := "Разговор вне записи"
-			if line.Recording != "" {
-				label = "Запись: " + line.Recording
-			}
-			fmt.Fprintf(&text, "%s\r\n\r\n", label)
-			lastRecord = line.Recording
-		}
-		fmt.Fprintf(&text, "[%s] %s\r\n%s\r\n\r\n", transcriptTimestamp(line.Time), line.Name, line.Text)
-	}
-	u.replaceTranscriptText(text.String())
-}
-
-// Updating the transcript must not pull the reader back down while reviewing a pause.
-func (u *windowUI) replaceTranscriptText(text string) {
-	h := u.controls[idTranscript]
-	first, _, _ := sendMessage.Call(h, 0xce, 0, 0)
-	count, _, _ := sendMessage.Call(h, 0xba, 0, 0)
-	var area rect
-	sendMessage.Call(h, 0xb2, 0, uintptr(unsafe.Pointer(&area)))
-	dc := call("GetDC", h)
-	old := gdi("SelectObject", dc, u.font)
-	var metrics [16]int32 // TEXTMETRICW; tmHeight is its first field.
-	gdi("GetTextMetricsW", dc, uintptr(unsafe.Pointer(&metrics[0])))
-	gdi("SelectObject", dc, old)
-	call("ReleaseDC", h, dc)
-	visible := max(1, (area.Bottom-area.Top)/max(1, metrics[0]))
-	bottom := call("GetWindowTextLengthW", h) == 0 || int(first)+int(visible) >= int(count)-1
-	var start, end uint32
-	sendMessage.Call(h, 0xb0, uintptr(unsafe.Pointer(&start)), uintptr(unsafe.Pointer(&end)))
-	sendMessage.Call(h, 0xb, 0, 0)
-	setText(h, text)
-	sendMessage.Call(h, 0xb, 1, 0)
-	if bottom {
-		length := call("GetWindowTextLengthW", h)
-		sendMessage.Call(h, 0xb1, length, length)
-		count, _, _ := sendMessage.Call(h, 0xba, 0, 0)
-		sendMessage.Call(h, 0xb6, 0, count)
-	} else {
-		sendMessage.Call(h, 0xb1, uintptr(start), uintptr(end))
-		now, _, _ := sendMessage.Call(h, 0xce, 0, 0)
-		sendMessage.Call(h, 0xb6, 0, first-now)
-	}
-	call("RedrawWindow", h, 0, 0, 0x405)
+	u.timeline.update(lines)
 }
